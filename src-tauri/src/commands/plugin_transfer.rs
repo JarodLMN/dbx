@@ -116,7 +116,17 @@ pub async fn plugin_transfer_preview(
     dbx_core::transfer::validate_transfer_request(&parsed)
         .map_err(|message| PluginTransferError::new("E-TRANSFER-INVALID-REQUEST", message))?;
     let _ = plugin_id;
-    Ok(dbx_core::plugin_transfer::preview(&state, &parsed, &request).await)
+    let mut preview = dbx_core::plugin_transfer::preview(&state, &parsed, &request).await;
+    if gate_request.dry_run {
+        // Opening pools and reading metadata is the only work a dry run does here. A
+        // failure to render the plan is a dry-run failure, not a request rejection.
+        preview.dry_run = Some(
+            dbx_core::plugin_transfer::dry_run_products(&state, &parsed)
+                .await
+                .map_err(|message| PluginTransferError::new("E-TRANSFER-DRYRUN-FAILED", message))?,
+        );
+    }
+    Ok(preview)
 }
 
 /// Run a transfer the user already approved in the app shell modal.
@@ -131,7 +141,7 @@ pub async fn plugin_transfer_run(
     request: Value,
     request_hash: String,
     approved: bool,
-) -> Result<String, PluginTransferError> {
+) -> Result<PluginTransferRun, PluginTransferError> {
     let state = state.inner().clone();
     let gate_request = gate_request(&request)?;
     gate::check_not_preconfirmed(&gate_request)?;
@@ -166,6 +176,18 @@ pub async fn plugin_transfer_run(
     // plugin may not set that bit itself — hence the overwrite after the checks above.
     parsed.drop_target_confirmed = true;
 
+    // A dry run returns its plan: the plugin must not have to rebuild it from the
+    // preview, and nothing below may write.
+    let products = if dry_run {
+        Some(
+            dbx_core::plugin_transfer::dry_run_products(&state, &parsed)
+                .await
+                .map_err(|message| PluginTransferError::new("E-TRANSFER-DRYRUN-FAILED", message))?,
+        )
+    } else {
+        None
+    };
+
     remember_run(&run_id, &plugin_id);
     let launched = crate::commands::transfer::launch_transfer(
         &app,
@@ -180,7 +202,17 @@ pub async fn plugin_transfer_run(
         forget_run(&run_id);
         return Err(PluginTransferError::new("E-TRANSFER-REJECTED", message));
     }
-    Ok(run_id)
+    Ok(PluginTransferRun { run_id, dry_run: products })
+}
+
+/// What `plugin_transfer_run` hands back. A real run only carries the id the plugin
+/// uses for progress and cancel; a dry run also carries the plan it resolved.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginTransferRun {
+    pub run_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dry_run: Option<dbx_core::plugin_transfer::DryRunProducts>,
 }
 
 /// Cancel one of *this* plugin's runs. A plugin cannot cancel an app run, nor another

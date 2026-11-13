@@ -11532,6 +11532,28 @@ pub(crate) async fn build_package_transfer_structure(
     .await
 }
 
+/// Plan - never execute - the structure DDL for the selected tables. Same generators the
+/// create pass uses, so a preview and the execution can never disagree on the DDL they
+/// render; the target is re-inspected when a real run starts.
+pub async fn preview_transfer_structure(
+    state: &Arc<AppState>,
+    request: &TransferRequest,
+    source_db_type: &DatabaseType,
+    target_db_type: &DatabaseType,
+    source_pool_key: &str,
+    target_pool_key: &str,
+) -> Result<TransferStructurePreview, String> {
+    structure_plan::build_structure_preview(
+        state,
+        request,
+        source_db_type,
+        target_db_type,
+        source_pool_key,
+        target_pool_key,
+    )
+    .await
+}
+
 pub async fn preview_transfer_ownership(
     state: &Arc<AppState>,
     request: &TransferRequest,

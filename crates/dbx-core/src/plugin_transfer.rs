@@ -7,6 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::Arc;
 
 use crate::connection::AppState;
 use crate::models::connection::DatabaseType;
@@ -53,8 +54,47 @@ pub struct TransferPreview {
     pub risk: gate::Risk,
     pub resolved: ResolvedTransfer,
     pub request_hash: String,
-    /// Operations the plugin's grant must cover (docs/07 §9).
+    /// Operations the plugin's grant must cover (docs/07 §9). Empty for a dry run.
     pub operations: Vec<String>,
+    /// Present only for a dry run: the statements the write pass would execute, plus the
+    /// rebuild plan when one was asked for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dry_run: Option<DryRunProducts>,
+}
+
+/// What a dry run would do, rendered by the very generators the write pass uses
+/// (docs/07 §13). Planning only: nothing here was executed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DryRunProducts {
+    /// `CREATE SCHEMA` / `CREATE TABLE` / index / foreign key / comment statements.
+    pub structure_sql: String,
+    pub operations: Vec<PlannedStatement>,
+    pub schema_objects_expanded: bool,
+    /// The rename / create / cleanup plan of `dropTargetBeforeCreate`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rebuild_sql: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backup_sql: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleanup_sql: Option<String>,
+    /// Roles the target lacks, so ownership DDL cannot be applied by the real run.
+    pub missing_owners: Vec<String>,
+    pub target_owner: String,
+}
+
+/// One planned operation, flattened for the plugin: the planner's enum becomes its serde
+/// label so the payload does not change shape when the planner grows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlannedStatement {
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub object_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_table: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_table: Option<String>,
 }
 
 /// serde representation of an enum as the string the UI and the hash use, without
@@ -148,5 +188,86 @@ pub async fn preview(state: &AppState, request: &TransferRequest, raw: &Value) -
             .into_iter()
             .map(|operation| operation.as_str().to_string())
             .collect(),
+        dry_run: None,
     }
+}
+
+async fn db_type_of(state: &AppState, connection_id: &str) -> Result<DatabaseType, String> {
+    let configs = state.configs.read().await;
+    configs.get(connection_id).map(|config| config.db_type).ok_or_else(|| format!("unknown connection {connection_id}"))
+}
+
+/// Render a dry run's products. Reads metadata and opens transfer pools, but every
+/// statement it returns comes from the planner the write pass shares - nothing is
+/// executed here, and the real run re-inspects the target before writing.
+pub async fn dry_run_products(state: &Arc<AppState>, request: &TransferRequest) -> Result<DryRunProducts, String> {
+    let source_db_type = db_type_of(state, &request.source_connection_id).await?;
+    let target_db_type = db_type_of(state, &request.target_connection_id).await?;
+    // A dry run only reads, so the target pool is opened read-only-ish: no DDL is sent
+    // through it. `ensure_transfer_pool` is cached per (connection, database).
+    let source_pool_key = crate::transfer::ensure_transfer_pool(
+        state,
+        &request.source_connection_id,
+        &request.source_database,
+        request.source_catalog.as_deref(),
+    )
+    .await?;
+    let target_pool_key = crate::transfer::ensure_transfer_pool(
+        state,
+        &request.target_connection_id,
+        &request.target_database,
+        request.target_catalog.as_deref(),
+    )
+    .await?;
+
+    // Ownership already renders the structure plan for structure-only and package
+    // requests, and the rebuild plan when asked for; every other content mode renders
+    // its DDL here, so a dry run always shows what the create pass would run.
+    let ownership = crate::transfer::preview_transfer_ownership(
+        state,
+        request,
+        &source_db_type,
+        &target_db_type,
+        &source_pool_key,
+        &target_pool_key,
+    )
+    .await?;
+    let structure = match ownership.structure {
+        Some(structure) => structure,
+        None => {
+            crate::transfer::preview_transfer_structure(
+                state,
+                request,
+                &source_db_type,
+                &target_db_type,
+                &source_pool_key,
+                &target_pool_key,
+            )
+            .await?
+        }
+    };
+    let (rebuild_sql, backup_sql, cleanup_sql) = match ownership.rebuild {
+        Some(plan) => (Some(plan.sql), plan.backup_sql, plan.cleanup_sql),
+        None => (None, None, None),
+    };
+
+    Ok(DryRunProducts {
+        structure_sql: structure.sql,
+        operations: structure
+            .operations
+            .iter()
+            .map(|operation| PlannedStatement {
+                kind: enum_label(&operation.kind),
+                object_name: operation.object_name.clone(),
+                source_table: operation.source_table.clone(),
+                target_table: operation.target_table.clone(),
+            })
+            .collect(),
+        schema_objects_expanded: structure.schema_objects_expanded,
+        rebuild_sql,
+        backup_sql,
+        cleanup_sql,
+        missing_owners: ownership.missing_owners,
+        target_owner: ownership.target_owner,
+    })
 }
