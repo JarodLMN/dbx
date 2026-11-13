@@ -11,7 +11,19 @@ import type { PluginAiRecommendation } from "@/types/pluginAiRecommendations";
 import { MAX_PLUGIN_SCHEMA_METADATA_NAME_CHARS, PLUGIN_SCHEMA_METADATA_CAPABILITY, PLUGIN_SCHEMA_METADATA_PERMISSION, type PluginTableContext, type PluginTableMetadata } from "@/types/pluginSchemaMetadata";
 import { MAX_PLUGIN_DATA_MAX_ROWS, MAX_PLUGIN_DATA_NAME_CHARS, MAX_PLUGIN_DATA_SQL_CHARS, MAX_PLUGIN_DATA_TIMEOUT_MS, PLUGIN_DATA_ACCESS_NOT_GRANTED, PLUGIN_DATA_CAPABILITY, PLUGIN_DATA_READ_PERMISSION, type PluginDataQueryRequest, type PluginDataQueryResult } from "@/types/pluginData";
 import { PLUGIN_CONNECTIONS_CAPABILITY, PLUGIN_CONNECTIONS_READ_PERMISSION, type PluginConnectionSummary } from "@/types/pluginConnection";
-import { PLUGIN_TRANSFER_CAPABILITY, PLUGIN_TRANSFER_PERMISSION, PLUGIN_TRANSFER_PREVIEW_CAPABILITY, requirePluginTransferRequest, type PluginTransferPreview, type PluginTransferRunHandle } from "@/types/pluginTransfer";
+import {
+  normalizePluginTransferIntent,
+  PLUGIN_TRANSFER_CAPABILITY,
+  PLUGIN_TRANSFER_FINISHED_METHOD,
+  PLUGIN_TRANSFER_PERMISSION,
+  PLUGIN_TRANSFER_PREVIEW_CAPABILITY,
+  PLUGIN_TRANSFER_PROGRESS_METHOD,
+  requirePluginTransferRequest,
+  type PluginTransferFinished,
+  type PluginTransferPreview,
+  type PluginTransferProgress,
+  type PluginTransferRunHandle,
+} from "@/types/pluginTransfer";
 import { floatingWindowLabel } from "@/lib/app/windowContext";
 import { parseFloatingWindowRequest, type FloatingRect, type OpenFloatingWindowRequest, type OpenFloatingWindowResult } from "@/lib/plugins/pluginFloatingWindow";
 
@@ -260,11 +272,14 @@ export interface PluginHostBridgeApi {
   /**
    * Run a transfer the user approved in the host's own dialog.
    *
-   * Deliberately optional: `run` without a host-owned confirm surface would let
-   * a plugin write by asking twice, so the bridge advertises `transferApi` only
-   * when this is present.
+   * The plugin supplies the request and, optionally, a human-readable `intent`
+   * the dialog quotes as "插件说明". It cannot supply an approval: the host
+   * previews the request itself, gets `requestHash` from that preview, asks the
+   * user, and only then calls the backend. Deliberately optional - `run` without
+   * a host-owned confirm surface would let a plugin write by asking twice, so the
+   * bridge advertises `transferApi` only when this is present.
    */
-  runTransfer?(pluginId: string, request: Record<string, unknown>, requestHash: string, approved: boolean): Promise<PluginTransferRunHandle>;
+  runTransfer?(pluginId: string, request: Record<string, unknown>, intent?: string): Promise<PluginTransferRunHandle>;
   /** Cancel one of this plugin's own runs; another plugin's run is refused by the backend. */
   cancelTransfer?(pluginId: string, runId: string): Promise<void>;
   closeTab?(): Promise<void> | void;
@@ -637,6 +652,30 @@ export class PluginHostBridge {
     this.post({ source: HOST_MESSAGE_SOURCE, version: BRIDGE_VERSION, type: "event", method: event.method, params: event.params });
   }
 
+  /**
+   * Deliver one progress tick of *this* plugin's run under `host.transfer.progress`
+   * (docs/07 §8).
+   *
+   * The generic `forwardEvent` path cannot carry it: `plugin-transfer-progress` is
+   * broadcast for every plugin run and needs `host.events`, which a write-only
+   * plugin does not declare. The caller filters by owner; this gate is the transfer
+   * permission itself, so progress and the run that produced it share one scope.
+   */
+  forwardTransferProgress(progress: PluginTransferProgress): void {
+    if (!this.hasPermission(PLUGIN_TRANSFER_PERMISSION)) return;
+    this.post({ source: HOST_MESSAGE_SOURCE, version: BRIDGE_VERSION, type: "event", method: PLUGIN_TRANSFER_PROGRESS_METHOD, params: progress });
+  }
+
+  /**
+   * Deliver how one of *this* plugin's runs ended under `host.transfer.finished`
+   * (docs/07 §8). Same gate as progress for the same reason: the finished record is
+   * part of the write path, not a general event a read-only plugin may see.
+   */
+  forwardTransferFinished(finished: PluginTransferFinished): void {
+    if (!this.hasPermission(PLUGIN_TRANSFER_PERMISSION)) return;
+    this.post({ source: HOST_MESSAGE_SOURCE, version: BRIDGE_VERSION, type: "event", method: PLUGIN_TRANSFER_FINISHED_METHOD, params: finished });
+  }
+
   forwardBinary(event: PluginBinaryEvent): void {
     if (event.pluginId !== this.plugin.manifest.id || !this.hasPermission("host.binary")) return;
     const target = this.targetWindow();
@@ -951,15 +990,18 @@ export class PluginHostBridge {
     }
     if (method === "host.transfer.run") {
       this.requirePermission(PLUGIN_TRANSFER_PERMISSION);
-      // `requestHash` and `approved` must come from the host's own dialog. Until
-      // that dialog exists there is nothing honest to forward, so the call fails
-      // closed even if a plugin ignores `capabilities.transferApi`.
+      // No `requestHash` / `approved` from the plugin: the host derives both from
+      // its own preview plus the user's answer, so a plugin cannot replay or skip
+      // a confirmation. Until that dialog exists there is nothing honest to
+      // forward, so the call fails closed even if a plugin ignores
+      // `capabilities.transferApi`.
       if (!this.api.runTransfer) throw new Error("Host transfer run is unavailable: this DBX build has no confirmation dialog for plugin writes");
       const input = requireRecord(params, "host.transfer.run params");
       const request = requirePluginTransferRequest(requireRecord(input.request, "host.transfer.run request"));
-      if (typeof input.requestHash !== "string" || !input.requestHash.trim()) throw new Error("host.transfer.run requires requestHash");
-      if (typeof input.approved !== "boolean") throw new Error("host.transfer.run requires an approved flag");
-      return this.api.runTransfer(this.plugin.manifest.id, request, input.requestHash.trim(), input.approved);
+      // The intent is a quotation, not a claim: bound it so a plugin cannot turn
+      // the dialog into an essay that buries the host's own risk lines.
+      const intent = normalizePluginTransferIntent(input.intent);
+      return this.api.runTransfer(this.plugin.manifest.id, request, intent);
     }
     if (method === "host.transfer.cancel") {
       this.requirePermission(PLUGIN_TRANSFER_PERMISSION);
@@ -1642,6 +1684,28 @@ export function pluginSdkSource(initialTheme?: PluginBridgeTheme): string {
         preview: (transferRequest) => request('host.transfer.preview', transferRequest),
         run: (transferRequest, intent) => request('host.transfer.run', { request: transferRequest, intent }),
         cancel: (args) => request('host.transfer.cancel', args || {}),
+        // Ticks of this plugin's own runs, filtered by runId on the plugin side
+        // (several runs may be in flight). Gate on capabilities.transferApi: a
+        // host that cannot run a transfer never sends progress.
+        onProgress: (listener) => {
+          const onEvent = (message) => {
+            if (message?.method !== '${PLUGIN_TRANSFER_PROGRESS_METHOD}' || !message.params) return;
+            listener(message.params);
+          };
+          listeners.event.add(onEvent);
+          return () => listeners.event.delete(onEvent);
+        },
+        // The last word on a run: one flat record per run, sent after the terminal
+        // progress tick. A ledger writes this row instead of reconstructing it from
+        // the ticks, which is why it carries duration and dryRun.
+        onFinished: (listener) => {
+          const onEvent = (message) => {
+            if (message?.method !== '${PLUGIN_TRANSFER_FINISHED_METHOD}' || !message.params) return;
+            listener(message.params);
+          };
+          listeners.event.add(onEvent);
+          return () => listeners.event.delete(onEvent);
+        },
       }),
       fileTransfer: Object.freeze({
         pick: (options) => request('host.pickFiles', options || {}),

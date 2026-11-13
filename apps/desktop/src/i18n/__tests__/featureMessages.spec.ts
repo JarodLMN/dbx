@@ -154,6 +154,23 @@ const FEATURE_MESSAGES: FeatureMessages[] = [
     keys: ["pluginPlatform.dataAccessConsent", "pluginPlatform.dataAccessConsentTitle", "pluginPlatform.aiTools.*", "pluginPlatform.dataAccess.*", "ai.toolApproval.*"],
     translated: true,
   },
+  // The write-confirmation and grant dialogs are the last thing between a plugin
+  // and the user's database: a locale that falls back to English here would show
+  // an English warning on a destructive action.
+  {
+    feature: "plugin transfer write confirmation",
+    keys: ["pluginPlatform.transferConfirm.*", "pluginPlatform.transferGrant.*"],
+    locales: ["en", "zh-CN"],
+    translated: true,
+  },
+  // The runtime switch and the revoke list are the two halves of "who may write":
+  // one closes the path, the other takes back a single connection's consent.
+  {
+    feature: "plugin transfer switch and write grants",
+    keys: ["pluginPlatform.transferWrites.*", "pluginPlatform.writeAccess.*"],
+    locales: ["en", "zh-CN"],
+    translated: true,
+  },
   { feature: "schema diff deploy ignores foreign key checks", keys: under("diff", ["ignoreForeignKeyChecks", "ignoreForeignKeyChecksHint"]), translated: true },
   { feature: "shortcut recorder", keys: under("settings", ["shortcutRecordKeys", "shortcutRecordKeysRecordingHint", "shortcutRecordKeysWindowInactive"]), locales: ALL_LOCALES.filter((locale) => locale !== "th") },
   { feature: "select current statement", keys: ["settings.shortcutSelectCurrentStatement", "editor.contextMenu.selectCurrentStatement"] },

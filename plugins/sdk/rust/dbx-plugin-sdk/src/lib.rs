@@ -192,7 +192,14 @@ pub struct UserInputOption {
 impl UserInputPrompt {
     /// A masked free-form question (verification codes, passwords, tokens).
     pub fn secret(prompt: impl Into<String>) -> Self {
-        Self { prompt: prompt.into(), title: None, echo: false, default_value: None, options: Vec::new(), timeout_secs: None }
+        Self {
+            prompt: prompt.into(),
+            title: None,
+            echo: false,
+            default_value: None,
+            options: Vec::new(),
+            timeout_secs: None,
+        }
     }
 
     /// A question whose answer is visible while typing (account names, paths).
@@ -303,12 +310,7 @@ impl HostClient {
         self.request_with_timeout(method, params, DEFAULT_HOST_REQUEST_TIMEOUT)
     }
 
-    pub fn request_with_timeout(
-        &self,
-        method: &str,
-        params: Value,
-        timeout: Duration,
-    ) -> Result<Value, PluginError> {
+    pub fn request_with_timeout(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, PluginError> {
         validate_protocol_name(method)?;
         let id = format!("plugin-{}", self.next_request_id.fetch_add(1, Ordering::Relaxed));
         let (sender, receiver) = mpsc::channel();
@@ -363,10 +365,7 @@ impl HostClient {
     /// Remembers what the host advertised at `plugin/initialize`.
     fn note_host_description(&self, params: &Value) {
         let host = params.get("host");
-        let api_version = host
-            .and_then(|host| host.get("hostApiVersion"))
-            .and_then(Value::as_str)
-            .map(str::to_string);
+        let api_version = host.and_then(|host| host.get("hostApiVersion")).and_then(Value::as_str).map(str::to_string);
         let features = host
             .and_then(|host| host.get("features"))
             .and_then(Value::as_array)
@@ -739,8 +738,8 @@ mod tests {
         host_client, install_host_client, request_user_input, HostClient, PluginTransport, UserInputAnswer,
         UserInputOption, UserInputPrompt, HOST_CLIENT, HOST_REQUEST_USER_INPUT_METHOD,
     };
-    use std::thread;
     use std::sync::{Arc, Mutex};
+    use std::thread;
 
     /// Output sink that records every frame the plugin writes.
     #[derive(Clone, Default)]
@@ -800,10 +799,8 @@ mod tests {
 
         // Simulate the host answering the outbound request.
         let request = loop {
-            if let Some(request) = output
-                .lines()
-                .into_iter()
-                .find(|line| line["method"] == HOST_REQUEST_USER_INPUT_METHOD)
+            if let Some(request) =
+                output.lines().into_iter().find(|line| line["method"] == HOST_REQUEST_USER_INPUT_METHOD)
             {
                 break request;
             }
@@ -822,7 +819,9 @@ mod tests {
             "result": { "action": "submit", "value": "123456" }
         })));
         // Host -> plugin requests and unknown answers stay on the server path.
-        assert!(!client.deliver_response(&serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "connection/test" })));
+        assert!(
+            !client.deliver_response(&serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "connection/test" }))
+        );
         assert!(!client.deliver_response(&serde_json::json!({ "jsonrpc": "2.0", "id": "plugin-999", "result": {} })));
 
         let answer = caller.join().unwrap().unwrap();
@@ -839,7 +838,9 @@ mod tests {
             thread::spawn(move || client.request_user_input(&UserInputPrompt::text("Account")))
         };
         let request = loop {
-            if let Some(request) = output.lines().into_iter().find(|line| line["method"] == HOST_REQUEST_USER_INPUT_METHOD) {
+            if let Some(request) =
+                output.lines().into_iter().find(|line| line["method"] == HOST_REQUEST_USER_INPUT_METHOD)
+            {
                 break request;
             }
             thread::sleep(Duration::from_millis(5));
@@ -862,7 +863,11 @@ mod tests {
         assert!(timeout.is_timeout());
 
         let timed_out = client
-            .request_with_timeout("host/requestUserInput", serde_json::json!({ "prompt": "x" }), Duration::from_millis(30))
+            .request_with_timeout(
+                "host/requestUserInput",
+                serde_json::json!({ "prompt": "x" }),
+                Duration::from_millis(30),
+            )
             .unwrap_err();
         assert!(timed_out.message.contains("did not answer"), "{}", timed_out.message);
     }

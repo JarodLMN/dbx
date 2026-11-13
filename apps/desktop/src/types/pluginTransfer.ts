@@ -110,7 +110,7 @@ export interface PluginTransferPreview {
   risk: PluginTransferRisk;
   resolved: PluginTransferResolved;
   /** Operations the plugin's grant must cover; empty for a dry run. */
-  operations: string[];
+  operations: PluginTransferOperation[];
   /** sha256(canonicalJson(request)) - the confirm step rejects a different one. */
   requestHash: string;
   /** Present only for a dry run. */
@@ -121,6 +121,137 @@ export interface PluginTransferPreview {
 export interface PluginTransferRunHandle {
   runId: string;
   dryRun?: PluginTransferDryRunProducts;
+}
+
+/**
+ * One write operation a grant can cover (docs/07 §9).
+ *
+ * Mirrors `gate::TransferOperation`: the serde labels are the wire names, so the
+ * strings below are what the backend parses and what a stored grant holds.
+ */
+export type PluginTransferOperation = "insert" | "truncate" | "overwrite" | "createTable" | "drop";
+
+export const PLUGIN_TRANSFER_OPERATIONS: readonly PluginTransferOperation[] = ["insert", "overwrite", "createTable", "truncate", "drop"];
+
+/**
+ * Destructive operations are never pre-checked in the grant dialog, and the confirm
+ * dialog raises them as risk reasons instead (docs/07 §9).
+ */
+export function isDestructiveTransferOperation(operation: PluginTransferOperation): boolean {
+  return operation === "truncate" || operation === "drop";
+}
+
+/** A stored `(pluginId, connectionId, operations[])` grant, as `get_grants` returns it. */
+export interface PluginTransferGrant {
+  /** Connection name at read time; absent when the connection no longer exists. */
+  connectionName?: string;
+  connectionId: string;
+  operations: PluginTransferOperation[];
+}
+
+/**
+ * One progress tick for a plugin-initiated run.
+ *
+ * Mirrors `TransferProgress` (`crates/dbx-core/src/data/transfer.rs`); the host
+ * adds nothing, so a plugin reads the same shape the app's own transfer panel
+ * does. `transferId` is the `runId` returned by `run`.
+ */
+export interface PluginTransferProgress {
+  transferId: string;
+  table: string;
+  tableIndex: number;
+  totalTables: number;
+  rowsTransferred: number;
+  totalRows: number | null;
+  /** `running` | `tableDone` | `done` | `error` | `cancelled`. */
+  status: string;
+  error: string | null;
+  /** True on the final tick only. */
+  terminal: boolean;
+}
+
+/**
+ * Event method a plugin receives its own run's ticks under (docs/07 §8).
+ *
+ * Not `host.transfer.progress` from the app's global broadcast: the host filters
+ * `pluginId` first and re-emits under this method, so a plugin can never observe
+ * another plugin's (or the app's) run.
+ */
+export const PLUGIN_TRANSFER_PROGRESS_METHOD = "host.transfer.progress";
+
+/** `plugin-transfer-progress` payload emitted by `launch_transfer`. */
+export interface PluginTransferProgressEvent {
+  pluginId: string;
+  progress: PluginTransferProgress;
+  terminal?: boolean;
+}
+
+/**
+ * Event method the finished record arrives under (docs/07 §8).
+ *
+ * `host.transfer.finished` is the one event a plugin's ledger must record; the
+ * progress stream ends with `terminal: true` as well, but that tick is a
+ * transfer-shaped packet and half its fields are per-table. This one is flat.
+ */
+export const PLUGIN_TRANSFER_FINISHED_METHOD = "host.transfer.finished";
+
+/**
+ * How a plugin-initiated run ended, as `plugin-transfer-finished` carries it.
+ *
+ * `status` is the serialized `TransferStatus` (`running | tableDone | done |
+ * error | cancelled`); a finished event is only ever sent for a terminal one.
+ * `rowsTransferred` is the runner's cumulative count - the runner does not
+ * separate rows read from rows written, so neither does this event.
+ * `dryRun` is true for a plan-only run: nothing was written and no ledger row
+ * should be booked as a write.
+ */
+export interface PluginTransferFinished {
+  runId: string;
+  status: string;
+  rowsTransferred: number;
+  totalRows: number | null;
+  durationMs: number;
+  error: string | null;
+  dryRun: boolean;
+}
+
+/** `plugin-transfer-finished` payload emitted by `launch_transfer`. */
+export interface PluginTransferFinishedEvent extends PluginTransferFinished {
+  pluginId: string;
+}
+
+/**
+ * The two bits behind `capabilities.transferApi` (docs/07 §17.1/§17.3).
+ *
+ * `featureEnabled` is the L1 compile flag, `enabled` the L2 user switch. The
+ * settings UI shows the switch only when the feature is compiled in, and the
+ * workbench injects `transfer.*` only when both are true.
+ */
+export interface PluginTransferSettings {
+  enabled: boolean;
+  featureEnabled: boolean;
+}
+
+/** Confirmation dialog lifetime (docs/07 §7): expiry denies, it never approves. */
+export const PLUGIN_TRANSFER_CONFIRM_TIMEOUT_MS = 120_000;
+
+/**
+ * Flatten the plugin's "why" into the one quotation the dialog shows.
+ *
+ * The plugin SDK hands over `{ title, reason }` (docs/07 §5 `intent.reason`), but
+ * older plugins pass a plain string. Either way this is a quotation inside the
+ * host's dialog and never a host claim, so it is bounded to a few lines and the
+ * numbers it carries are ignored - the host gets its estimate from the request.
+ */
+export function normalizePluginTransferIntent(value: unknown): string | undefined {
+  const max = 2000;
+  if (typeof value === "string") return value.trim() ? value.trim().slice(0, max) : undefined;
+  if (!value || typeof value !== "object") return undefined;
+  const record = value as Record<string, unknown>;
+  const title = typeof record.title === "string" ? record.title.trim() : "";
+  const reason = typeof record.reason === "string" ? record.reason.trim() : "";
+  const text = [title, reason].filter(Boolean).join("\n");
+  return text ? text.slice(0, max) : undefined;
 }
 
 /**

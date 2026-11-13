@@ -5,6 +5,11 @@
 //! app shell (an in-app modal). A plugin can therefore *ask* for a transfer and
 //! *observe* its own run, but it cannot approve one, and it cannot touch another
 //! plugin's run.
+//!
+//! Two of these commands are deliberately **not** behind the runtime switch (docs/07
+//! §17.1 L2): `plugin_transfer_cancel` and the grant pair. Turning the switch off must
+//! not strand an in-flight run, and revoking consent has to stay possible while the
+//! write path is closed — a closed switch is when a careful user revokes.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -71,6 +76,30 @@ fn parse_request(request: &Value) -> Result<TransferRequest, PluginTransferError
         .map_err(|error| GateError::invalid_request(format!("request does not match TransferRequest: {error}")).into())
 }
 
+/// Whether plugin-initiated writes are allowed at all (docs/07 §17.1).
+///
+/// Two bits, not one: a build without the `plugin-transfer` feature stays closed even
+/// when the stored setting says "on", because that value can outlive the build that
+/// wrote it (open a nightly, close the switch, ship the stock build). The check is a
+/// no-op guard on the read path only — it never interrupts a run already launched.
+async fn ensure_enabled(state: &Arc<AppState>) -> Result<(), PluginTransferError> {
+    if !cfg!(feature = "plugin-transfer") {
+        return Err(PluginTransferError::new(
+            "E-TRANSFER-DISABLED",
+            "This DBX build does not include plugin initiated writes",
+        ));
+    }
+    match state.storage.load_plugin_transfer_enabled().await {
+        Ok(true) => Ok(()),
+        // Fail closed on a storage error too: "could not read the switch" is not "on".
+        Ok(false) => Err(PluginTransferError::new(
+            "E-TRANSFER-DISABLED",
+            "Plugin initiated writes are turned off in Settings \u{203a} Plugins",
+        )),
+        Err(message) => Err(PluginTransferError::new("E-TRANSFER-DISABLED", message)),
+    }
+}
+
 /// Read-only targets are refused before anything is shown or run.
 async fn ensure_writable_target(state: &Arc<AppState>, target_connection_id: &str) -> Result<(), PluginTransferError> {
     match ensure_connection_writable(state, target_connection_id, "Transfer").await {
@@ -95,6 +124,20 @@ async fn grants_for(state: &Arc<AppState>, plugin_id: &str) -> Result<Vec<Transf
         .collect())
 }
 
+/// "仅本次允许": the operations the user ticked in the grant dialog for this one call.
+///
+/// Unknown names are rejected instead of dropped: a typo must not quietly shrink an
+/// approval the user believes is complete.
+fn parse_session_grant(operations: Option<Vec<String>>) -> Result<BTreeSet<TransferOperation>, PluginTransferError> {
+    let mut session = BTreeSet::new();
+    for operation in operations.unwrap_or_default() {
+        let parsed = TransferOperation::parse(&operation)
+            .ok_or_else(|| GateError::invalid_request(format!("unknown transfer operation: {operation}")))?;
+        session.insert(parsed);
+    }
+    Ok(session)
+}
+
 /// Resolve what a request would do, with the risk the host sees. No writes, no pool
 /// creation: this is what the modal renders and what `plugin_transfer_run` re-derives.
 #[tauri::command]
@@ -104,6 +147,7 @@ pub async fn plugin_transfer_preview(
     request: Value,
 ) -> Result<dbx_core::plugin_transfer::TransferPreview, PluginTransferError> {
     let state = state.inner().clone();
+    ensure_enabled(&state).await?;
     let gate_request = gate_request(&request)?;
     gate::check_not_preconfirmed(&gate_request)?;
     gate::check_same_endpoint(&gate_request)?;
@@ -133,6 +177,10 @@ pub async fn plugin_transfer_preview(
 ///
 /// `request_hash` and `approved` come from the modal, but the host re-derives the hash
 /// from `request`, so an approval for one request cannot be replayed for another.
+///
+/// `session_grant` carries "仅本次允许": the operations the user ticked in the grant
+/// dialog for this call alone. It is never persisted — `plugin_transfer_set_grant`
+/// stays the only writer of a standing grant (docs/07 §9).
 #[tauri::command]
 pub async fn plugin_transfer_run(
     app: AppHandle,
@@ -140,9 +188,11 @@ pub async fn plugin_transfer_run(
     plugin_id: String,
     request: Value,
     request_hash: String,
+    session_grant: Option<Vec<String>>,
     approved: bool,
 ) -> Result<PluginTransferRun, PluginTransferError> {
     let state = state.inner().clone();
+    ensure_enabled(&state).await?;
     let gate_request = gate_request(&request)?;
     gate::check_not_preconfirmed(&gate_request)?;
     gate::check_same_endpoint(&gate_request)?;
@@ -168,9 +218,11 @@ pub async fn plugin_transfer_run(
 
     gate::check_concurrency(runs_in_flight(&plugin_id))?;
     let grants = grants_for(&state, &plugin_id).await?;
-    // A dry run needs no grant: it writes nothing, so the needed set is empty and the
-    // lookup is skipped (a real run still needs a grant covering every operation).
-    gate::check_grant_or_dry_run(&grants, &parsed.target_connection_id, &gate_request)?;
+    let session = parse_session_grant(session_grant)?;
+    // A dry run needs neither a grant nor an approval: it writes nothing, so the
+    // needed set is empty. A real run needs a standing grant or this one call's
+    // approval covering every operation it would perform.
+    gate::check_grant_or_session(&grants, &parsed.target_connection_id, &gate_request, &session)?;
 
     // The modal's approval *is* the drop-target confirmation (docs/07 §13.3), and the
     // plugin may not set that bit itself — hence the overwrite after the checks above.
@@ -232,8 +284,30 @@ pub async fn plugin_transfer_cancel(plugin_id: String, run_id: String) -> Result
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransferGrantView {
+    /// Connection name at read time, so the revoke list can name a grant without a
+    /// second lookup; `None` means the connection is gone and only its id is left.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connection_name: Option<String>,
     pub connection_id: String,
     pub operations: Vec<String>,
+}
+
+/// Stored grants with names resolved, for the plugin details page (docs/07 §9).
+async fn grant_views(state: &Arc<AppState>, plugin_id: &str) -> Result<Vec<TransferGrantView>, PluginTransferError> {
+    let stored = state
+        .storage
+        .load_plugin_transfer_grants(plugin_id)
+        .await
+        .map_err(|message| PluginTransferError::new("E-TRANSFER-NOT-AUTHORIZED", message))?;
+    let configs = state.configs.read().await;
+    Ok(stored
+        .into_iter()
+        .map(|(connection_id, operations)| TransferGrantView {
+            connection_name: configs.get(&connection_id).map(|config| config.name.clone()),
+            connection_id,
+            operations,
+        })
+        .collect())
 }
 
 #[tauri::command]
@@ -242,12 +316,7 @@ pub async fn plugin_transfer_get_grants(
     plugin_id: String,
 ) -> Result<Vec<TransferGrantView>, PluginTransferError> {
     let state = state.inner().clone();
-    let stored = state
-        .storage
-        .load_plugin_transfer_grants(&plugin_id)
-        .await
-        .map_err(|message| PluginTransferError::new("E-TRANSFER-NOT-AUTHORIZED", message))?;
-    Ok(stored.into_iter().map(|(connection_id, operations)| TransferGrantView { connection_id, operations }).collect())
+    grant_views(&state, &plugin_id).await
 }
 
 /// Write a grant. Only the app shell calls this, after the user answered "always allow"
@@ -272,10 +341,66 @@ pub async fn plugin_transfer_set_grant(
             }
         }
     }
-    let stored = state
+    state
         .storage
         .set_plugin_transfer_grant(&plugin_id, &connection_id, normalized.into_iter().collect(), granted)
         .await
         .map_err(|message| PluginTransferError::new("E-TRANSFER-NOT-AUTHORIZED", message))?;
-    Ok(stored.into_iter().map(|(connection_id, operations)| TransferGrantView { connection_id, operations }).collect())
+    grant_views(&state, &plugin_id).await
+}
+
+/// The two bits behind `capabilities.transferApi` (docs/07 §17.1/§17.3).
+///
+/// `featureEnabled` is the L1 compile flag, `enabled` the L2 user switch. The app shell
+/// needs both to decide whether to offer the switch at all: a build without the feature
+/// must not show a setting that can only be ineffective (§17.1).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginTransferSettings {
+    pub enabled: bool,
+    pub feature_enabled: bool,
+}
+
+impl PluginTransferSettings {
+    fn current(enabled: bool) -> Self {
+        Self { enabled, feature_enabled: cfg!(feature = "plugin-transfer") }
+    }
+}
+
+/// Read the switch. Always registered, even in a build without the feature: this is how
+/// the app shell learns that the feature is missing instead of guessing from a version.
+#[tauri::command]
+pub async fn plugin_transfer_settings(
+    state: State<'_, Arc<AppState>>,
+) -> Result<PluginTransferSettings, PluginTransferError> {
+    let state = state.inner().clone();
+    let enabled = state
+        .storage
+        .load_plugin_transfer_enabled()
+        .await
+        .map_err(|message| PluginTransferError::new("E-TRANSFER-DISABLED", message))?;
+    Ok(PluginTransferSettings::current(enabled))
+}
+
+/// Flip the switch. Turning it on in a build without the feature is refused rather than
+/// stored, so the value always means what it says (docs/07 §17.1 L2).
+#[tauri::command]
+pub async fn plugin_transfer_set_enabled(
+    state: State<'_, Arc<AppState>>,
+    enabled: bool,
+) -> Result<PluginTransferSettings, PluginTransferError> {
+    let state = state.inner().clone();
+    let settings = PluginTransferSettings::current(enabled);
+    if enabled && !settings.feature_enabled {
+        return Err(PluginTransferError::new(
+            "E-TRANSFER-DISABLED",
+            "This DBX build does not include plugin initiated writes",
+        ));
+    }
+    state
+        .storage
+        .save_plugin_transfer_enabled(enabled)
+        .await
+        .map_err(|message| PluginTransferError::new("E-TRANSFER-DISABLED", message))?;
+    Ok(settings)
 }

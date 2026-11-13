@@ -127,6 +127,7 @@ pub(crate) async fn launch_transfer(
     };
     let run_app = app.clone();
     let terminal_app = app.clone();
+    let started_at = std::time::Instant::now();
     tokio::spawn(async move {
         let progress_app = run_app.clone();
         let progress_plugin = plugin_id.clone();
@@ -155,6 +156,24 @@ pub(crate) async fn launch_transfer(
             let _ = terminal_app.emit(
                 "plugin-transfer-progress",
                 serde_json::json!({ "pluginId": plugin_id, "progress": &terminal, "terminal": true }),
+            );
+            // `host.transfer.finished` (docs/07 §8): the one record a plugin's ledger
+            // needs. Sent flat, after the terminal tick, so a listener that only knows
+            // `onProgress` still ends the same way and a ledger reader never has to
+            // re-walk the progress shape for four fields. `dryRun` is carried so a
+            // plan-only run is never booked as a write.
+            let _ = terminal_app.emit(
+                "plugin-transfer-finished",
+                serde_json::json!({
+                    "pluginId": plugin_id,
+                    "runId": &terminal.transfer_id,
+                    "status": &terminal.status,
+                    "rowsTransferred": terminal.rows_transferred,
+                    "totalRows": terminal.total_rows,
+                    "durationMs": started_at.elapsed().as_millis() as u64,
+                    "error": &terminal.error,
+                    "dryRun": dry_run,
+                }),
             );
         }
         emit_terminal_progress(&terminal_app, history.as_ref(), terminal).await;

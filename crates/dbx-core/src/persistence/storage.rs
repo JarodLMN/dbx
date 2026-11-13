@@ -129,6 +129,10 @@ const MAX_PLUGIN_DATA_GRANTS_PER_PLUGIN: usize = 512;
 /// grants on purpose: the user must be able to revoke write consent alone.
 const PLUGIN_TRANSFER_GRANTS_KEY: &str = "plugin_transfer_grants";
 const MAX_PLUGIN_TRANSFER_GRANTS_PER_PLUGIN: usize = 512;
+/// Runtime switch for the whole plugin write path (docs/07 §17.1 L2). Stored next
+/// to the write grants so "turned off" and "no consent" live in one bucket; the
+/// default follows the compile flag, so a build without `plugin-transfer` stays off.
+const PLUGIN_TRANSFER_ENABLED_KEY: &str = "plugin_transfer_enabled";
 const APP_STATE_AI_GLOBAL_INSTRUCTIONS_KEY: &str = "ai_global_custom_instructions";
 const APP_STATE_AI_CHAT_SELECTION_KEY: &str = "ai_chat_selection_v1";
 // Keep the existing key so previously persisted publish records remain readable.
@@ -5840,6 +5844,25 @@ impl Storage {
         .await
     }
 
+    /// Whether plugin-initiated writes are allowed at all. Absent means "follow the
+    /// build": a host compiled without `plugin-transfer` has no write path, and a
+    /// host compiled with it defaults to on because the feature *is* the opt-in.
+    pub async fn load_plugin_transfer_enabled(&self) -> Result<bool, String> {
+        let settings = self.load_app_settings_json().await?;
+        Ok(settings
+            .get(PLUGIN_TRANSFER_ENABLED_KEY)
+            .and_then(|value| value.as_bool())
+            .unwrap_or(cfg!(feature = "plugin-transfer")))
+    }
+
+    /// Turns plugin-initiated writes on or off. Unlike revoking a grant this is not
+    /// per plugin and not per connection: it closes the gate for everyone at once.
+    pub async fn save_plugin_transfer_enabled(&self, enabled: bool) -> Result<(), String> {
+        let mut settings = self.load_app_settings_json().await?;
+        settings.insert(PLUGIN_TRANSFER_ENABLED_KEY.to_string(), serde_json::Value::Bool(enabled));
+        self.save_app_settings_json(&settings).await
+    }
+
     /// Write grants for `host.transfer:run`: `[(connectionId, operations)]`.
     ///
     /// Stored in the app-settings bucket next to the read grants instead of a new
@@ -5870,8 +5893,11 @@ impl Storage {
     ) -> Result<Vec<(String, Vec<String>)>, String> {
         let plugin_id = normalized_setting_id(plugin_id, "plugin id")?;
         let connection_id = normalized_setting_id(connection_id, "connection id")?;
-        let mut operations: Vec<String> =
-            operations.into_iter().map(|operation| operation.trim().to_string()).filter(|operation| !operation.is_empty()).collect();
+        let mut operations: Vec<String> = operations
+            .into_iter()
+            .map(|operation| operation.trim().to_string())
+            .filter(|operation| !operation.is_empty())
+            .collect();
         operations.sort();
         operations.dedup();
         self.with_conn(move |conn| {
@@ -5885,7 +5911,9 @@ impl Storage {
                 _ => serde_json::Map::new(),
             };
             if granted {
-                if !connections.contains_key(&connection_id) && connections.len() >= MAX_PLUGIN_TRANSFER_GRANTS_PER_PLUGIN {
+                if !connections.contains_key(&connection_id)
+                    && connections.len() >= MAX_PLUGIN_TRANSFER_GRANTS_PER_PLUGIN
+                {
                     return Err(format!(
                         "A plugin can hold at most {MAX_PLUGIN_TRANSFER_GRANTS_PER_PLUGIN} write grants"
                     ));

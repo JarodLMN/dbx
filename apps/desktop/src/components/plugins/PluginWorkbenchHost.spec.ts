@@ -32,6 +32,11 @@ vi.mock("@/lib/backend/api", () => ({
   readPluginUiEntry: mocks.readPluginUiEntry,
   readPluginUiAsset: mocks.readPluginUiAsset,
   subscribePluginEvents: mocks.subscribePluginEvents,
+  // 挂载时就订阅一次（docs/07 §8）：未 mock 会在 onMounted 里抛 “No export is defined”。
+  subscribePluginTransferProgress: vi.fn().mockResolvedValue(() => undefined),
+  subscribePluginTransferFinished: vi.fn().mockResolvedValue(() => undefined),
+  // L2 开关（§17.1）：未 mock 则能力位恒为 false，转移相关用例会静默降级。
+  getPluginTransferSettings: vi.fn().mockResolvedValue({ enabled: true, featureEnabled: true }),
 }));
 vi.mock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: mocks.isTauriRuntime }));
 vi.mock("@/lib/common/clipboard", () => ({ copyToClipboard: vi.fn() }));

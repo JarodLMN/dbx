@@ -1,6 +1,9 @@
 <script setup lang="ts">
 import { mysqlDataCharsetEnabled } from "@/lib/connection/mysqlDataCharset";
 import PluginOpenUrlDialog from "./PluginOpenUrlDialog.vue";
+import TransferConfirmDialog from "./transfer/TransferConfirmDialog.vue";
+import TransferGrantDialog from "./transfer/TransferGrantDialog.vue";
+import type { PluginTransferOperation, PluginTransferRunHandle } from "@/types/pluginTransfer";
 import { computed, inject, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { AlertTriangle, Loader2 } from "@lucide/vue";
 import * as api from "@/lib/backend/api";
@@ -62,6 +65,11 @@ const { t, locale: appLocale } = useI18n();
 const { isDark, themeRevision } = useTheme();
 const settingsStore = useSettingsStore();
 const urlDialog = ref<InstanceType<typeof PluginOpenUrlDialog>>();
+// host.transfer:run — the two host-owned dialogs (docs/07 §5-§7, §9). They are
+// mounted with the workbench instead of being created on demand so the plugin's
+// `run` request has a surface to wait on from the first call.
+const transferConfirmDialog = ref<InstanceType<typeof TransferConfirmDialog>>();
+const transferGrantDialog = ref<InstanceType<typeof TransferGrantDialog>>();
 const openAiConversation = inject(OPEN_PLUGIN_AI_CONVERSATION, undefined);
 // Per-plugin grant for `script-src 'unsafe-eval'`; flipping it rebuilds the
 // sandbox document (and must not reuse a doc cached under the other setting).
@@ -160,6 +168,14 @@ const frameReady = ref(false);
 const error = ref("");
 let bridge: PluginHostBridge | undefined;
 let unsubscribeEvents: (() => void) | undefined;
+let unsubscribeTransferProgress: (() => void) | undefined;
+let unsubscribeTransferFinished: (() => void) | undefined;
+/**
+ * L2 runtime switch (docs/07 §17.1): injected into the bridge only when the build
+ * carries `plugin-transfer` *and* the user left it on. Never inferred from a
+ * version number - the host answers both bits.
+ */
+const transferEnabled = ref(false);
 let disposed = false;
 let loadGeneration = 0;
 // Boot timing (§8.3 loading lifecycle): one console.debug line per iframe load
@@ -674,12 +690,16 @@ function createBridge() {
       grantDataAccess: async (pluginId, connectionId) => {
         await api.setPluginDataGrant(pluginId, connectionId, true);
       },
-      // host.transfer:run — preview and dry runs only. `runTransfer` is left
-      // unwired on purpose: it needs the host-side confirm dialog (L4), so the
-      // bridge advertises `transferApi` as false and plugins degrade to E0
-      // instead of believing they can write.
-      previewTransfer: isTauriRuntime() ? (pluginId, request) => api.previewPluginTransfer(pluginId, request) : undefined,
-      cancelTransfer: isTauriRuntime() ? (pluginId, runId) => api.cancelPluginTransfer(pluginId, runId) : undefined,
+      // host.transfer:run — the full write path. `runTransfer` is wired only on
+      // the desktop host, because the confirm and grant dialogs are what make it
+      // honest: the plugin names the request, the host resolves the preview, asks
+      // the user, and only then calls the backend. See runPluginTransfer below.
+      // The L2 switch closes all three at once: capabilities.transferApi is derived
+      // from their presence, and a host that advertises a write path it refuses
+      // would only train plugins to surface a dead button.
+      previewTransfer: isTauriRuntime() && transferEnabled.value ? (pluginId, request) => api.previewPluginTransfer(pluginId, request) : undefined,
+      runTransfer: isTauriRuntime() && transferEnabled.value ? (pluginId, request, intent) => runPluginTransfer(pluginId, request, intent) : undefined,
+      cancelTransfer: isTauriRuntime() && transferEnabled.value ? (pluginId, runId) => api.cancelPluginTransfer(pluginId, runId) : undefined,
       closeTab: () => emit("closeTab"),
       // Floating widget windows (§8.3 surface "window"). Desktop-only: the web
       // host omits them so capabilities.floating stays false and the plugin can
@@ -735,6 +755,50 @@ function createBridge() {
     if (!connectionId) return;
     await useConnectionStore().repushPluginConnection(connectionId);
   };
+}
+
+/**
+ * `host.transfer.run`: preview, then ask, then run (docs/07 §5-§9).
+ *
+ * Order matters and none of it is optional:
+ * 1. the host previews the plugin's request itself, so `requestHash`, the risk
+ *    level and the operation set are host-derived, never plugin claims;
+ * 2. when no standing grant covers those operations, the grant dialog decides
+ *    whether the plugin may even ask for this connection - 始终允许 persists,
+ *    仅本次允许 becomes `sessionGrant` and is never stored, and L2 offers no
+ *    始终允许 at all;
+ * 3. the confirm dialog decides this one call, and its answer is the only thing
+ *    that fills `approved`.
+ * A dry run skips 2 and 3: it writes nothing, so there is nothing to approve.
+ */
+async function runPluginTransfer(pluginId: string, request: Record<string, unknown>, intent?: string): Promise<PluginTransferRunHandle> {
+  const preview = await api.previewPluginTransfer(pluginId, request);
+  if (preview.risk.dryRun) return api.runPluginTransfer(pluginId, request, preview.requestHash);
+
+  const target = preview.resolved.target;
+  const needed = preview.operations;
+  // A stored grant covers "may we ask". Anything less and the user is asked first.
+  const grants = await api.getPluginTransferGrants(pluginId);
+  const covered = grants.some((grant) => grant.connectionId === target.connectionId && needed.every((operation) => grant.operations.includes(operation)));
+  let sessionGrant: PluginTransferOperation[] | undefined;
+  if (!covered) {
+    const grantDialog = transferGrantDialog.value;
+    if (!grantDialog) throw new Error("E-TRANSFER-NOT-AUTHORIZED: no grant dialog is available for this write");
+    const answer = await grantDialog.request(preview, { allowAlways: preview.risk.level !== "l2" });
+    if (answer.decision === "denied") {
+      throw new Error(`E-TRANSFER-NOT-AUTHORIZED: the user refused to let ${props.plugin.manifest.name} write to ${target.name}`);
+    }
+    if (answer.decision === "always") await api.setPluginTransferGrant(pluginId, target.connectionId, answer.operations, true);
+    else sessionGrant = answer.operations;
+  }
+
+  const confirmDialog = transferConfirmDialog.value;
+  if (!confirmDialog) throw new Error("E-TRANSFER-REJECTED: no confirmation dialog is available for this write");
+  const outcome = await confirmDialog.request(preview, intent);
+  if (outcome === "expired") throw new Error("E-TRANSFER-EXPIRED: the confirmation expired before it was answered");
+  if (outcome !== "approved") throw new Error("E-TRANSFER-REJECTED: the user cancelled the write");
+
+  return api.runPluginTransfer(pluginId, request, preview.requestHash, sessionGrant);
 }
 
 /**
@@ -875,6 +939,10 @@ function onFrameLoad() {
 onMounted(async () => {
   window.addEventListener("message", onMessage);
   document.addEventListener("dbx:tauri-file-drop", onHostFileDrop);
+  // Read the L2 switch before the bridge exists: what we inject *is* the capability.
+  // A failed read stays closed, because an unread switch is not a licence to write.
+  const transferSettings = isTauriRuntime() ? await api.getPluginTransferSettings().catch(() => undefined) : undefined;
+  transferEnabled.value = transferSettings?.enabled === true && transferSettings.featureEnabled === true;
   const unsubscribe = await api.subscribePluginEvents(
     (event) => bridge?.forwardEvent(event),
     (event) => bridge?.forwardBinary(event),
@@ -884,6 +952,34 @@ onMounted(async () => {
     return;
   }
   unsubscribeEvents = unsubscribe;
+  // Progress fan-out (docs/07 §8): the backend broadcasts every plugin run on one
+  // channel, so each workbench keeps only its own plugin's ticks and hands them
+  // on under host.transfer.progress. A plugin can never see another's run.
+  const unsubscribeProgress = isTauriRuntime()
+    ? await api.subscribePluginTransferProgress((event) => {
+        if (event.pluginId !== props.plugin.manifest.id) return;
+        bridge?.forwardTransferProgress(event.progress);
+      })
+    : undefined;
+  if (disposed) {
+    unsubscribeProgress?.();
+    return;
+  }
+  unsubscribeTransferProgress = unsubscribeProgress;
+  // Finished records ride the same single broadcast channel and the same owner
+  // filter; the plugin records one ledger row from this instead of guessing from
+  // the last terminal tick (docs/07 §8).
+  const unsubscribeFinished = isTauriRuntime()
+    ? await api.subscribePluginTransferFinished((event) => {
+        if (event.pluginId !== props.plugin.manifest.id) return;
+        bridge?.forwardTransferFinished(event);
+      })
+    : undefined;
+  if (disposed) {
+    unsubscribeFinished?.();
+    return;
+  }
+  unsubscribeTransferFinished = unsubscribeFinished;
   await loadWorkbench();
 });
 
@@ -937,6 +1033,10 @@ onBeforeUnmount(() => {
   window.removeEventListener("message", onMessage);
   document.removeEventListener("dbx:tauri-file-drop", onHostFileDrop);
   disposeLocalFileHandles();
+  unsubscribeTransferProgress?.();
+  unsubscribeTransferProgress = undefined;
+  unsubscribeTransferFinished?.();
+  unsubscribeTransferFinished = undefined;
   unsubscribeEvents?.();
 });
 </script>
@@ -944,6 +1044,11 @@ onBeforeUnmount(() => {
 <template>
   <div class="relative flex size-full overflow-hidden" :class="hostSurfaceClass">
     <PluginOpenUrlDialog ref="urlDialog" :plugin-id="plugin.manifest.id" :plugin-name="plugin.manifest.name" :permissions="plugin.manifest.permissions" />
+    <!-- host.transfer:run: the grant dialog answers "may this plugin ask for this
+         connection", the confirm dialog answers "do it this time". Both are
+         host-owned; a plugin neither renders nor answers them. -->
+    <TransferGrantDialog ref="transferGrantDialog" />
+    <TransferConfirmDialog ref="transferConfirmDialog" :plugin-name="plugin.manifest.name" />
     <div v-if="loading" class="absolute inset-0 z-10 flex items-center justify-center text-sm text-muted-foreground" :class="overlayClass">
       <Loader2 class="mr-2 size-4 animate-spin" />
       {{ t("pluginPlatform.loadingTitle", { title }) }}

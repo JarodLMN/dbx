@@ -484,6 +484,28 @@ pub fn check_grant_or_dry_run(
     check_grant(grants, connection_id, &needed)
 }
 
+/// A one-shot approval: the user allowed *this* call, nothing is persisted.
+///
+/// `session` is what the grant dialog's checkboxes reported. It can only widen the
+/// call it was given for — a standing grant stays the only thing that lets a later
+/// call skip the prompt, which is what keeps "may we ask" and "do it now" apart
+/// (docs/07 §9). An empty needed set (dry run) needs neither.
+pub fn check_grant_or_session(
+    grants: &[TransferGrant],
+    connection_id: &str,
+    request: &TransferGateRequest,
+    session: &BTreeSet<TransferOperation>,
+) -> Result<(), GateError> {
+    let needed = operations_for_request(request);
+    if needed.is_empty() {
+        return Ok(());
+    }
+    if check_grant(grants, connection_id, &needed).is_ok() || needed.is_subset(session) {
+        return Ok(());
+    }
+    Err(GateError::not_authorized())
+}
+
 /// docs/07 §7: at most `MAX_PLUGIN_TRANSFER_RUNS` runs in flight per plugin.
 pub fn check_concurrency(in_flight: usize) -> Result<(), GateError> {
     if in_flight >= MAX_PLUGIN_TRANSFER_RUNS { Err(GateError::concurrent_limit()) } else { Ok(()) }
@@ -718,6 +740,46 @@ mod tests {
     fn real_request_still_needs_a_grant() {
         let request = base_request();
         assert_eq!(check_grant_or_dry_run(&[], "c2", &request).unwrap_err().code, "E-TRANSFER-NOT-AUTHORIZED");
+    }
+
+    #[test]
+    fn session_approval_is_needed_when_no_grant_is_stored() {
+        let request = base_request();
+        let none = BTreeSet::new();
+        assert_eq!(
+            check_grant_or_session(&[], "c2", &request, &none).unwrap_err().code,
+            "E-TRANSFER-NOT-AUTHORIZED"
+        );
+        let insert: BTreeSet<_> = [TransferOperation::Insert].into_iter().collect();
+        assert!(check_grant_or_session(&[], "c2", &request, &insert).is_ok());
+    }
+
+    #[test]
+    fn session_approval_must_cover_every_operation() {
+        let mut request = base_request();
+        request.drop_target_before_create = true;
+        let insert: BTreeSet<_> = [TransferOperation::Insert].into_iter().collect();
+        assert_eq!(
+            check_grant_or_session(&[], "c2", &request, &insert).unwrap_err().code,
+            "E-TRANSFER-NOT-AUTHORIZED"
+        );
+        let full: BTreeSet<_> = [TransferOperation::Insert, TransferOperation::Drop].into_iter().collect();
+        assert!(check_grant_or_session(&[], "c2", &request, &full).is_ok());
+    }
+
+    #[test]
+    fn stored_grant_makes_session_approval_unnecessary() {
+        let request = base_request();
+        let grant = TransferGrant {
+            plugin_id: "com.dbx.datax".into(),
+            connection_id: "c2".into(),
+            operations: vec![TransferOperation::Insert],
+        };
+        // A dry run needs nothing at all, even with no grant and no approval.
+        let mut dry = base_request();
+        dry.dry_run = true;
+        assert!(check_grant_or_session(&[], "c2", &dry, &BTreeSet::new()).is_ok());
+        assert!(check_grant_or_session(&[grant], "c2", &request, &BTreeSet::new()).is_ok());
     }
 
     #[test]

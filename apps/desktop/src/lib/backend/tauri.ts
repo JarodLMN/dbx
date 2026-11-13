@@ -82,7 +82,7 @@ import { collectBrowserSupportInfo } from "@/lib/app/supportInfo";
 import type { PluginPlanCapabilities, PluginPlanRequest, PluginPlanResult } from "@/types/pluginPlan";
 import type { PluginTableMetadata, PluginTableMetadataRequest } from "@/types/pluginSchemaMetadata";
 import type { PluginDataGrant, PluginDataQueryRequest, PluginDataQueryResult } from "@/types/pluginData";
-import { rethrowPluginTransferError, type PluginTransferPreview } from "@/types/pluginTransfer";
+import { rethrowPluginTransferError, type PluginTransferFinishedEvent, type PluginTransferGrant, type PluginTransferOperation, type PluginTransferPreview, type PluginTransferProgressEvent, type PluginTransferRunHandle, type PluginTransferSettings } from "@/types/pluginTransfer";
 import type { AiToolApprovalOutcome, PluginToolPreview } from "@/types/pluginAiTools";
 
 function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
@@ -2533,6 +2533,50 @@ export async function cancelPluginTransfer(pluginId: string, runId: string): Pro
   return invoke<void>("plugin_transfer_cancel", { pluginId, runId }).catch(rethrowPluginTransferError);
 }
 
+/**
+ * Start a write the user approved in the host's own confirm dialog.
+ *
+ * `requestHash` comes from {@link previewPluginTransfer}, never from the plugin, and
+ * the backend re-derives it before running: an approval for one request cannot be
+ * replayed for another. `sessionGrant` carries the "仅本次允许" checkbox result of
+ * the grant dialog for this call alone - it is never persisted, so the standing
+ * grant stays the only thing that lets a later call skip the prompt.
+ */
+export async function runPluginTransfer(pluginId: string, request: Record<string, unknown>, requestHash: string, sessionGrant?: readonly string[]): Promise<PluginTransferRunHandle> {
+  return invoke<PluginTransferRunHandle>("plugin_transfer_run", {
+    pluginId,
+    request,
+    requestHash,
+    sessionGrant: sessionGrant && sessionGrant.length > 0 ? [...sessionGrant] : null,
+    approved: true,
+  }).catch(rethrowPluginTransferError);
+}
+
+/** Standing grants for `(pluginId, connectionId, operations[])`; used to decide whether to ask. */
+export async function getPluginTransferGrants(pluginId: string): Promise<PluginTransferGrant[]> {
+  return invoke<PluginTransferGrant[]>("plugin_transfer_get_grants", { pluginId }).catch(rethrowPluginTransferError);
+}
+
+/** Write or revoke a standing grant; the grant dialog and the revoke list are the callers. */
+export async function setPluginTransferGrant(pluginId: string, connectionId: string, operations: readonly PluginTransferOperation[], granted: boolean): Promise<PluginTransferGrant[]> {
+  return invoke<PluginTransferGrant[]>("plugin_transfer_set_grant", { pluginId, connectionId, operations: [...operations], granted }).catch(rethrowPluginTransferError);
+}
+
+/**
+ * The L1 compile flag and the L2 user switch (docs/07 §17.1).
+ *
+ * Always registered - a build without the feature still answers, so the app shell can
+ * hide the switch instead of inferring the build from a version number.
+ */
+export async function getPluginTransferSettings(): Promise<PluginTransferSettings> {
+  return invoke<PluginTransferSettings>("plugin_transfer_settings").catch(rethrowPluginTransferError);
+}
+
+/** Turn plugin-initiated writes on or off for every plugin at once. */
+export async function setPluginTransferEnabled(enabled: boolean): Promise<PluginTransferSettings> {
+  return invoke<PluginTransferSettings>("plugin_transfer_set_enabled", { enabled }).catch(rethrowPluginTransferError);
+}
+
 export async function buildDroppedFilePreviewSql(options: DroppedFilePreviewSqlOptions): Promise<string | undefined> {
   const result = await invoke<string | null>("build_dropped_file_preview_sql", {
     options,
@@ -3389,6 +3433,27 @@ export async function subscribePluginEvents(onEvent: (event: PluginEvent) => voi
     unlistenEvent();
     unlistenBinary();
   };
+}
+
+/**
+ * Subscribe to progress of plugin-initiated runs (`plugin-transfer-progress`).
+ *
+ * This is the same run the app's own progress bar would show, carrying the owning
+ * `pluginId`, so each workbench can filter down to the runs its plugin started and
+ * hand them on under `host.transfer.progress` (docs/07 §8).
+ */
+export async function subscribePluginTransferProgress(onProgress: (event: PluginTransferProgressEvent) => void): Promise<UnlistenFn> {
+  return listen<PluginTransferProgressEvent>("plugin-transfer-progress", (event) => onProgress(event.payload));
+}
+
+/**
+ * Subscribe to finished records of plugin-initiated runs (docs/07 §8).
+ *
+ * Broadcast for every plugin run like the progress channel; the workbench keeps only
+ * its own plugin's and re-emits under `host.transfer.finished`.
+ */
+export async function subscribePluginTransferFinished(onFinished: (event: PluginTransferFinishedEvent) => void): Promise<UnlistenFn> {
+  return listen<PluginTransferFinishedEvent>("plugin-transfer-finished", (event) => onFinished(event.payload));
 }
 
 /**

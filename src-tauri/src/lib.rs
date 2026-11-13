@@ -3206,6 +3206,8 @@ pub fn run() {
             commands::plugin_transfer::plugin_transfer_cancel,
             commands::plugin_transfer::plugin_transfer_get_grants,
             commands::plugin_transfer::plugin_transfer_set_grant,
+            commands::plugin_transfer::plugin_transfer_settings,
+            commands::plugin_transfer::plugin_transfer_set_enabled,
             commands::database_export::begin_database_backup_snapshot,
             commands::database_export::export_database_sql,
             commands::database_export::cancel_database_export,

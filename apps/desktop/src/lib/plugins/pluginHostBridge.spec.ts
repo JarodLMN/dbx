@@ -1715,16 +1715,52 @@ describe("PluginHostBridge", () => {
     expect(api.previewTransfer).toHaveBeenCalledTimes(1);
   });
 
-  it("refuses host.transfer.run until the host owns the dialog and scopes cancel to the calling plugin", async () => {
-    const api = transferApi();
-    const { call } = transferHarness(["host.transfer:run"], api);
+  it("forwards host.transfer.run through the host's own approval and scopes cancel to the calling plugin", async () => {
+    // No runTransfer on the api: the host has no confirm surface, so the call fails
+    // closed even though the plugin declared the permission.
+    const denied = transferHarness(["host.transfer:run"], transferApi());
+    expect(await denied.call("run", "host.transfer.run", { request: { transferId: "t1" } })).toMatchObject({ error: expect.stringContaining("no confirmation dialog") });
 
-    const run = await call("run", "host.transfer.run", { request: { transferId: "t1" }, requestHash: "hash-1", approved: true });
-    expect(run).toMatchObject({ error: expect.stringContaining("no confirmation dialog") });
+    const runTransfer = vi.fn().mockResolvedValue({ runId: "run-1" });
+    const api = transferApi({ runTransfer });
+    const { call } = transferHarness(["host.transfer:run"], api);
+    // `requestHash` and `approved` from the plugin are ignored: the host previews
+    // the request itself and only the dialog's answer approves the write.
+    const run = await call("run-ok", "host.transfer.run", {
+      request: { transferId: "t1" },
+      intent: { title: "  把 orders 同步  ", reason: "每天一次" },
+      requestHash: "plugin-supplied-hash",
+      approved: true,
+    });
+    expect(run).toMatchObject({ result: { runId: "run-1" } });
+    expect(runTransfer).toHaveBeenCalledWith("sample", { transferId: "t1" }, "把 orders 同步\n每天一次");
 
     expect(await call("cancel", "host.transfer.cancel", { runId: "run-1" })).toMatchObject({ result: null });
     expect(api.cancelTransfer).toHaveBeenCalledWith("sample", "run-1");
     expect(await call("cancel-no-id", "host.transfer.cancel", {})).toMatchObject({ error: "runId is invalid" });
+  });
+
+  it("forwards run progress under host.transfer.progress, gated by the transfer permission", () => {
+    const progress = {
+      transferId: "run-1",
+      table: "orders",
+      tableIndex: 0,
+      totalTables: 1,
+      rowsTransferred: 10,
+      totalRows: 100,
+      status: "running",
+      error: null,
+      terminal: false,
+    };
+    const allowed = transferHarness(["host.transfer:run"], transferApi());
+    allowed.bridge.forwardTransferProgress(progress);
+    expect(allowed.messages).toContainEqual(expect.objectContaining({ type: "event", method: "host.transfer.progress", params: progress }));
+
+    // Progress rides on host.transfer:run, not host.events: a write-only plugin
+    // must not need the generic event channel to watch its own run.
+    const denied = transferHarness(["host.events"], transferApi());
+    denied.bridge.forwardTransferProgress(progress);
+    expect(denied.messages).toHaveLength(0);
   });
 
   it("advertises transferPreview without transferApi until the confirm surface exists", () => {
@@ -1746,6 +1782,9 @@ describe("PluginHostBridge", () => {
     expect(source).toContain("transfer: Object.freeze({");
     expect(source).toContain("request('host.transfer.preview', transferRequest)");
     expect(source).toContain("request('host.transfer.cancel', args || {})");
+    // Progress is filtered by method here so the plugin only sees host.transfer.progress.
+    expect(source).toContain("onProgress: (listener) => {");
+    expect(source).toContain("'host.transfer.progress'");
   });
 
   it("denies clipboard reads on hosts without a consent surface and rate-limits repeated reads", async () => {

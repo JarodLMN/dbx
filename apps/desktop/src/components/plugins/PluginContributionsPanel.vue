@@ -45,6 +45,8 @@ import { useToast } from "@/composables/useToast";
 import PluginShortcutSettings from "./PluginShortcutSettings.vue";
 import PluginIcon from "@/components/plugins/PluginIcon.vue";
 import PluginAiAccessSection from "@/components/plugins/PluginAiAccessSection.vue";
+import PluginTransferGrantsSection from "@/components/plugins/PluginTransferGrantsSection.vue";
+import PluginTransferSetting from "@/components/plugins/PluginTransferSetting.vue";
 import { installedPluginProvidesMcpTools, marketplacePluginProvidesMcpTools } from "@/lib/plugins/pluginMcpMark";
 import PluginGraphicsEngineSection from "@/components/plugins/PluginGraphicsEngineSection.vue";
 import * as api from "@/lib/backend/api";
@@ -1941,6 +1943,8 @@ onBeforeUnmount(() => {
 
                 <PluginAiAccessSection :key="selectedDefinition.plugin.manifest.id" :plugin="selectedDefinition.plugin" />
 
+                <PluginTransferGrantsSection :key="`write-${selectedDefinition.plugin.manifest.id}`" :plugin="selectedDefinition.plugin" />
+
                 <PluginGraphicsEngineSection :key="`graphics-${selectedDefinition.plugin.manifest.id}`" :plugin="selectedDefinition.plugin" />
 
                 <div v-if="connectionProviders.some((entry) => entry.plugin.manifest.id === selectedPluginId)" class="space-y-3">
@@ -2003,6 +2007,7 @@ onBeforeUnmount(() => {
       <TabsContent value="settings" class="@container m-0 min-h-0 flex-1 overflow-y-auto">
         <div class="space-y-4 pb-2">
           <PluginShortcutSettings />
+          <PluginTransferSetting />
           <section class="space-y-3 rounded-xl border p-4">
             <div class="flex items-start gap-3">
               <div class="rounded-md bg-primary/10 p-2 text-primary"><FileUp class="size-4" /></div>

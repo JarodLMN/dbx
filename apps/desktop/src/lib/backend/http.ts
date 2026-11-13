@@ -273,7 +273,7 @@ import type {
 import type { QueryEditability } from "@/lib/sql/sqlAnalysis";
 import type { PluginTableMetadata, PluginTableMetadataRequest } from "@/types/pluginSchemaMetadata";
 import type { PluginDataGrant, PluginDataQueryRequest, PluginDataQueryResult } from "@/types/pluginData";
-import type { PluginTransferPreview } from "@/types/pluginTransfer";
+import type { PluginTransferFinishedEvent, PluginTransferGrant, PluginTransferOperation, PluginTransferPreview, PluginTransferProgressEvent, PluginTransferRunHandle, PluginTransferSettings } from "@/types/pluginTransfer";
 import type { PluginToolPreview } from "@/types/pluginAiTools";
 import type { CsvQuoteMode } from "@/lib/export/csvQuoteMode";
 import type { MigrationPreflight, MigrationReport, CredentialResetPreparation, CredentialResetReport } from "./migration";
@@ -2090,6 +2090,40 @@ export async function previewPluginTransfer(_pluginId: string, _request: Record<
 }
 
 export async function cancelPluginTransfer(_pluginId: string, _runId: string): Promise<void> {
+  throw new Error("Plugin transfers are not available in the web backend");
+}
+
+export async function runPluginTransfer(_pluginId: string, _request: Record<string, unknown>, _requestHash: string, _sessionGrant?: readonly string[]): Promise<PluginTransferRunHandle> {
+  throw new Error("Plugin transfers are not available in the web backend");
+}
+
+export async function getPluginTransferGrants(_pluginId: string): Promise<PluginTransferGrant[]> {
+  throw new Error("Plugin transfers are not available in the web backend");
+}
+
+export async function setPluginTransferGrant(_pluginId: string, _connectionId: string, _operations: readonly PluginTransferOperation[], _granted: boolean): Promise<PluginTransferGrant[]> {
+  throw new Error("Plugin transfers are not available in the web backend");
+}
+
+/** No web run can produce `plugin-transfer-progress`; a no-op listener keeps the transports aligned. */
+export async function subscribePluginTransferProgress(_onProgress: (event: PluginTransferProgressEvent) => void): Promise<() => void> {
+  return () => undefined;
+}
+
+/** Same for the finished channel: the web host runs nothing, so it never ends anything. */
+export async function subscribePluginTransferFinished(_onFinished: (event: PluginTransferFinishedEvent) => void): Promise<() => void> {
+  return () => undefined;
+}
+
+/**
+ * The web build carries no `plugin-transfer` feature, so the switch reports itself as
+ * absent rather than throwing: the settings page must be able to hide it quietly.
+ */
+export async function getPluginTransferSettings(): Promise<PluginTransferSettings> {
+  return { enabled: false, featureEnabled: false };
+}
+
+export async function setPluginTransferEnabled(_enabled: boolean): Promise<PluginTransferSettings> {
   throw new Error("Plugin transfers are not available in the web backend");
 }
 
