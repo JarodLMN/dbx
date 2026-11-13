@@ -13,7 +13,8 @@
 pub mod gate;
 
 pub use gate::{
-    canonical_request_json, check_concurrency, check_grant, check_not_preconfirmed, check_readonly_target,
+    canonical_request_json, check_concurrency, check_grant, check_grant_or_dry_run, check_not_preconfirmed,
+    check_readonly_target,
     check_same_endpoint, classify_risk, operations_for_request, request_hash, ConfirmOutcome, GateError,
     Risk, RiskInput, RiskLevel, RiskReason, RiskReasonCode, TableFilterView, TransferGateRequest, TransferGrant,
     TransferOperation, CONFIRM_TIMEOUT_SECS, MAX_PLUGIN_TRANSFER_RUNS, TRANSFER_PERMISSION,

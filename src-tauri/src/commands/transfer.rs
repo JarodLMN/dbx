@@ -26,7 +26,7 @@ pub async fn start_transfer(
     request: TransferRequest,
     operation_timeout_secs: Option<u64>,
 ) -> Result<(), String> {
-    launch_transfer(&app, state.inner().clone(), request, TaskLifecycleOwner::Tauri, operation_timeout_secs)
+    launch_transfer(&app, state.inner().clone(), request, TaskLifecycleOwner::Tauri, operation_timeout_secs, false)
         .await
 }
 
@@ -35,17 +35,24 @@ pub async fn start_transfer(
 /// The app and the plugin API (`host.transfer:run`) must run the *same* validation
 /// chain, so the chain lives here and both entry points delegate. `owner` only
 /// changes how the run is recorded and which progress events are emitted.
+///
+/// `dry_run` is a run option, not a request field: it must not be serialized into the
+/// journal or the request hash, and it relaxes exactly the three checks that exist
+/// because something gets written (read-only target, drop confirmation, journal).
 pub(crate) async fn launch_transfer(
     app: &AppHandle,
     state: Arc<AppState>,
     request: TransferRequest,
     owner: TaskLifecycleOwner,
     operation_timeout_secs: Option<u64>,
+    dry_run: bool,
 ) -> Result<(), String> {
     dbx_core::transfer::check_data_charset_transfer(&state, &request).await?;
     dbx_core::transfer::validate_transfer_operation_timeout(operation_timeout_secs)?;
     // Reject transfer early if the target connection is read-only — writing to it is inherently required
-    ensure_connection_writable(&state, &request.target_connection_id, "Transfer").await?;
+    if !dry_run {
+        ensure_connection_writable(&state, &request.target_connection_id, "Transfer").await?;
+    }
 
     // Validate connections exist
     let source_db_type = get_db_type(&state, &request.source_connection_id).await?;
@@ -54,16 +61,19 @@ pub(crate) async fn launch_transfer(
     dbx_core::transfer::validate_transfer_database_pair(&request, &source_db_type, &target_db_type)?;
 
     // `drop_target_before_create` rebuilds target tables; gate the dialect and require an
-    // explicit confirmation for production databases.
-    dbx_core::transfer_rebuild::ensure_drop_target_allowed(
-        &state,
-        &request.target_connection_id,
-        &request.target_database,
-        target_db_type,
-        request.drop_target_before_create,
-        request.drop_target_confirmed,
-    )
-    .await?;
+    // explicit confirmation for production databases. A dry run rebuilds nothing, so the
+    // confirmation requirement would only train the caller to click through it.
+    if !dry_run {
+        dbx_core::transfer_rebuild::ensure_drop_target_allowed(
+            &state,
+            &request.target_connection_id,
+            &request.target_database,
+            target_db_type,
+            request.drop_target_before_create,
+            request.drop_target_confirmed,
+        )
+        .await?;
+    }
 
     // Cross-family object transfers are validated inside transfer_schema_objects:
     // only mechanically rewriteable kinds (views, sequences) are allowed.
@@ -97,10 +107,16 @@ pub(crate) async fn launch_transfer(
     )
     .await?;
 
-    let history = match TransferTaskJournal::accept(&state.storage, &state, &request, owner.clone()).await {
-        Ok(history) => history,
-        Err(TaskHistoryStorageError::RunIdConflict) => return Err("TRANSFER_RUN_ID_CONFLICT".to_string()),
-        Err(error) => return Err(error.code().to_string()),
+    // A dry run is not a lifecycle event: recording it would pollute task history and
+    // its `transferId` would collide with the real run that follows.
+    let history = if dry_run {
+        None
+    } else {
+        match TransferTaskJournal::accept(&state.storage, &state, &request, owner.clone()).await {
+            Ok(history) => history,
+            Err(TaskHistoryStorageError::RunIdConflict) => return Err("TRANSFER_RUN_ID_CONFLICT".to_string()),
+            Err(error) => return Err(error.code().to_string()),
+        }
     };
 
     // Plugin runs get their own event so the bridge can filter on the id it owns; the
@@ -123,6 +139,7 @@ pub(crate) async fn launch_transfer(
             target_pool_key,
             history.clone(),
             operation_timeout_secs,
+            dry_run,
             move |progress| {
                 if let Some(plugin_id) = progress_plugin.as_deref() {
                     let _ = progress_app.emit(

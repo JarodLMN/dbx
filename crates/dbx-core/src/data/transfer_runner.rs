@@ -92,6 +92,8 @@ pub async fn run_transfer<F>(
     target_pool_key: String,
     history: Option<TransferTaskJournal>,
     operation_timeout_secs: Option<u64>,
+    // Plan only: resolve and validate, then stop before the first write.
+    dry_run: bool,
     progress_callback: F,
 ) -> TransferProgress
 where
@@ -116,7 +118,7 @@ where
         )
         .await?;
         let mut table_structure =
-            if request.oracle_packages.as_ref().is_some_and(|packages| packages.pending_tables.is_some()) {
+            if !dry_run && request.oracle_packages.as_ref().is_some_and(|packages| packages.pending_tables.is_some()) {
                 Some(
                     super::transfer::build_package_transfer_structure(
                         &state,
@@ -131,8 +133,12 @@ where
             } else {
                 None
             };
-        let packages =
-            crate::schema::oracle_routines::claim_transfer_packages(&state, &request, table_structure.as_mut()).await?;
+        let packages = if dry_run {
+            // Claiming packages mutates host state, so a dry run claims nothing.
+            None
+        } else {
+            crate::schema::oracle_routines::claim_transfer_packages(&state, &request, table_structure.as_mut()).await?
+        };
         Ok::<_, crate::schema::oracle_routines::PackageTransferPreflightError>((routine, packages))
     }
     .await
@@ -236,6 +242,38 @@ where
 
         let total_tables = sorted_tables.len();
         log::info!("[transfer] starting transfer_id={} tables={}", transfer_id, total_tables);
+
+        // Dry run: everything below this line writes - the Xugu object preflight, the
+        // rename pre-pass, the create/insert pass, schema objects and the backup drops.
+        // Stopping here, after the read-only preflight and after tables were resolved,
+        // is one choke point in front of all of them: no write point is reachable, even
+        // by a later refactor that adds another one. The plan itself is `TransferPreview`
+        // (`dbx_core::plugin_transfer::preview`); this terminal event only says "nothing
+        // moved".
+        if dry_run {
+            log::info!("[transfer] dry run transfer_id={} tables={}", transfer_id, total_tables);
+            emit_terminal_progress(
+                &app,
+                history.as_ref(),
+                TransferProgress {
+                    oracle_package_approval: None,
+                    oracle_package_preflight: None,
+                    oracle_routine_operation: None,
+                    transfer_id: transfer_id.clone(),
+                    table: "dry-run".to_string(),
+                    table_index: 0,
+                    total_tables,
+                    rows_transferred: 0,
+                    total_rows: None,
+                    status: TransferStatus::Done,
+                    error: None,
+                    terminal: true,
+                },
+            )
+            .await;
+            super::transfer::clear_cancelled(&transfer_id).await;
+            return;
+        }
 
         let mut failed_tables: Vec<String> = Vec::new();
         let mut pending_fk_alters: Vec<(String, String)> = Vec::new();
@@ -951,6 +989,7 @@ mod tests {
                 "no-target-pool".into(),
                 None,
                 None,
+                false,
                 |_| panic!("compatibility rejection must precede progress"),
             )
             .await;
@@ -987,6 +1026,7 @@ mod tests {
                 "not-a-target-pool".into(),
                 None,
                 None,
+                false,
                 |_| panic!("Unsupported package request must stop before progress or writes"),
             )
             .await;
@@ -1055,6 +1095,7 @@ mod tests {
             target_pool,
             None,
             None,
+            false,
             move |progress| {
                 observed_for_callback.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(progress);
             },
@@ -1144,6 +1185,7 @@ mod tests {
             target_pool,
             None,
             None,
+            false,
             |_| {},
         )
         .await;

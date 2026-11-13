@@ -136,12 +136,9 @@ pub async fn plugin_transfer_run(
     let gate_request = gate_request(&request)?;
     gate::check_not_preconfirmed(&gate_request)?;
     gate::check_same_endpoint(&gate_request)?;
-    if gate_request.dry_run {
-        // The gate already understands dry runs (no grant, no write risk, no L2), but
-        // the runner cannot honour one yet: it would still write. Refusing here is
-        // what keeps an "approved dry run" from silently becoming a real write.
-        return Err(GateError::dryrun_unsupported().into());
-    }
+    // Plan-only run: the runner stops before its first write, `launch_transfer` skips the
+    // read-only veto / drop confirmation / journal, and the gate asked for no grant.
+    let dry_run = gate_request.dry_run;
 
     if gate::request_hash(&request) != request_hash {
         return Err(GateError::stale().into());
@@ -151,7 +148,9 @@ pub async fn plugin_transfer_run(
     }
 
     let mut parsed = parse_request(&request)?;
-    ensure_writable_target(&state, &parsed.target_connection_id).await?;
+    if !dry_run {
+        ensure_writable_target(&state, &parsed.target_connection_id).await?;
+    }
     if parsed.transfer_id.trim().is_empty() {
         return Err(GateError::invalid_request("transferId is required").into());
     }
@@ -159,7 +158,9 @@ pub async fn plugin_transfer_run(
 
     gate::check_concurrency(runs_in_flight(&plugin_id))?;
     let grants = grants_for(&state, &plugin_id).await?;
-    gate::check_grant(&grants, &parsed.target_connection_id, &gate::operations_for_request(&gate_request))?;
+    // A dry run needs no grant: it writes nothing, so the needed set is empty and the
+    // lookup is skipped (a real run still needs a grant covering every operation).
+    gate::check_grant_or_dry_run(&grants, &parsed.target_connection_id, &gate_request)?;
 
     // The modal's approval *is* the drop-target confirmation (docs/07 §13.3), and the
     // plugin may not set that bit itself — hence the overwrite after the checks above.
@@ -172,6 +173,7 @@ pub async fn plugin_transfer_run(
         parsed,
         TaskLifecycleOwner::Plugin(plugin_id.clone()),
         None,
+        dry_run,
     )
     .await;
     if let Err(message) = launched {

@@ -217,6 +217,7 @@ pub async fn start_transfer(
             target_pool_key,
             history,
             operation_timeout_secs,
+            false, // the web route always writes; dry runs are plugin-facing only
             move |progress| send_transfer_progress(&progress_channel_for_run, &progress),
         )
         .await;
