@@ -26,7 +26,22 @@ pub async fn start_transfer(
     request: TransferRequest,
     operation_timeout_secs: Option<u64>,
 ) -> Result<(), String> {
-    let state = state.inner().clone();
+    launch_transfer(&app, state.inner().clone(), request, TaskLifecycleOwner::Tauri, operation_timeout_secs)
+        .await
+}
+
+/// Validate + journal + spawn a transfer.
+///
+/// The app and the plugin API (`host.transfer:run`) must run the *same* validation
+/// chain, so the chain lives here and both entry points delegate. `owner` only
+/// changes how the run is recorded and which progress events are emitted.
+pub(crate) async fn launch_transfer(
+    app: &AppHandle,
+    state: Arc<AppState>,
+    request: TransferRequest,
+    owner: TaskLifecycleOwner,
+    operation_timeout_secs: Option<u64>,
+) -> Result<(), String> {
     dbx_core::transfer::check_data_charset_transfer(&state, &request).await?;
     dbx_core::transfer::validate_transfer_operation_timeout(operation_timeout_secs)?;
     // Reject transfer early if the target connection is read-only — writing to it is inherently required
@@ -82,13 +97,23 @@ pub async fn start_transfer(
     )
     .await?;
 
-    let history = match TransferTaskJournal::accept(&state.storage, &state, &request, TaskLifecycleOwner::Tauri).await {
+    let history = match TransferTaskJournal::accept(&state.storage, &state, &request, owner.clone()).await {
         Ok(history) => history,
         Err(TaskHistoryStorageError::RunIdConflict) => return Err("TRANSFER_RUN_ID_CONFLICT".to_string()),
         Err(error) => return Err(error.code().to_string()),
     };
 
+    // Plugin runs get their own event so the bridge can filter on the id it owns; the
+    // app keeps receiving `transfer-progress` exactly as before.
+    let plugin_id = match &owner {
+        TaskLifecycleOwner::Plugin(plugin_id) => Some(plugin_id.clone()),
+        _ => None,
+    };
+    let run_app = app.clone();
+    let terminal_app = app.clone();
     tokio::spawn(async move {
+        let progress_app = run_app.clone();
+        let progress_plugin = plugin_id.clone();
         let terminal = dbx_core::transfer_runner::run_transfer(
             state,
             request,
@@ -98,10 +123,24 @@ pub async fn start_transfer(
             target_pool_key,
             history.clone(),
             operation_timeout_secs,
-            |progress| emit_progress(&app, progress),
+            move |progress| {
+                if let Some(plugin_id) = progress_plugin.as_deref() {
+                    let _ = progress_app.emit(
+                        "plugin-transfer-progress",
+                        serde_json::json!({ "pluginId": plugin_id, "progress": &progress }),
+                    );
+                }
+                emit_progress(&progress_app, progress);
+            },
         )
         .await;
-        emit_terminal_progress(&app, history.as_ref(), terminal).await;
+        if let Some(plugin_id) = plugin_id.as_deref() {
+            let _ = terminal_app.emit(
+                "plugin-transfer-progress",
+                serde_json::json!({ "pluginId": plugin_id, "progress": &terminal, "terminal": true }),
+            );
+        }
+        emit_terminal_progress(&terminal_app, history.as_ref(), terminal).await;
     });
 
     Ok(())

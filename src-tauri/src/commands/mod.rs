@@ -48,6 +48,7 @@ pub mod plugin_file;
 pub mod plugin_media;
 pub mod plugin_storage;
 pub mod plugins;
+pub mod plugin_transfer;
 pub mod prompt_template;
 pub mod query;
 pub mod query_cancel;
