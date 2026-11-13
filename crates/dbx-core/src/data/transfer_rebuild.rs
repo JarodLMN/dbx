@@ -279,6 +279,49 @@ pub(crate) async fn complete_rebuild_journal(state: &AppState, transfer_id: &str
     state.storage.delete_state(&rebuild_journal_key(transfer_id)).await
 }
 
+/// How risky `drop_target_before_create` is for one target, without raising.
+///
+/// The plugin transfer preview has to *show* the risk before the user is asked, so the
+/// rule is expressed as a classifier and `ensure_drop_target_allowed` keeps the fail-fast
+/// behaviour on top of it (docs/07 §3.1). Preview callers must not treat this as
+/// permission: nothing here rejects anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropTargetRisk {
+    /// Target database counts as production (explicit flag, database list, or unknown
+    /// connection, which fails closed).
+    pub production: bool,
+    /// Target dialect supports renaming the table to a backup first.
+    pub supported: bool,
+    /// Human readable reason for the preview and for the confirm dialog.
+    pub reason: Option<String>,
+}
+
+/// Classify `drop_target_before_create` for a target (docs/07 §3.1).
+pub async fn classify_drop_target(
+    state: &AppState,
+    target_connection_id: &str,
+    target_database: &str,
+    target_database_type: DatabaseType,
+) -> DropTargetRisk {
+    let supported = supports_drop_target_before_create(target_database_type);
+    let production = {
+        let configs = state.configs.read().await;
+        configs
+            .get(target_connection_id)
+            .map(|config| is_production_database(config, target_database))
+            // Fail closed: an unknown target connection is treated as production.
+            .unwrap_or(true)
+    };
+    let reason = if !supported {
+        Some(format!("dropping the target table before creating it is not supported for {}", target_database_type.as_str()))
+    } else if production {
+        Some(format!("rebuilding tables in production database '{target_database}'"))
+    } else {
+        None
+    };
+    DropTargetRisk { production, supported, reason }
+}
+
 /// Gate `drop_target_before_create` before a transfer starts.
 ///
 /// Both the Tauri command and the web route call this, so the desktop app and the HTTP API
@@ -294,22 +337,15 @@ pub async fn ensure_drop_target_allowed(
     if !drop_target_before_create {
         return Ok(());
     }
-    if !supports_drop_target_before_create(target_database_type) {
+    let risk = classify_drop_target(state, target_connection_id, target_database, target_database_type).await;
+    if !risk.supported {
         return Err(format!(
             "{DROP_TARGET_UNSUPPORTED_DATABASE}: dropping the target table before creating it is not supported for \
              {}.",
             target_database_type.as_str()
         ));
     }
-    let production = {
-        let configs = state.configs.read().await;
-        configs
-            .get(target_connection_id)
-            .map(|config| is_production_database(config, target_database))
-            // Fail closed: an unknown target connection is treated as production.
-            .unwrap_or(true)
-    };
-    if production && !drop_target_confirmed {
+    if risk.production && !drop_target_confirmed {
         return Err(format!(
             "{DROP_TARGET_CONFIRMATION_REQUIRED}: rebuilding tables in production database '{target_database}' \
              requires explicit confirmation."

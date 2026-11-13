@@ -13,8 +13,10 @@ name = "dbx_lib"
 crate-type = ["rlib"]
 
 [features]
-default = ["duckdb-sidecar", "dynamodb", "mq-admin", "sqlite-multiple-ciphers", "system-fonts", "os-keyring", "sqlserver-native-attention"]
+default = ["duckdb-sidecar", "dynamodb", "mq-admin", "sqlite-multiple-ciphers", "system-fonts", "os-keyring", "sqlserver-native-attention", "plugin-transfer"]
 custom-protocol = ["tauri/custom-protocol"]
+# Plugin-initiated writes (`host.transfer:run`, docs/07). Part of the desktop build.
+plugin-transfer = ["dbx-core/plugin-transfer"]
 duckdb-sidecar = ["dbx-core/duckdb-sidecar"]
 os-keyring = ["dbx-core/os-keyring"]
 sqlserver-native-attention = ["dbx-core/sqlserver-native-attention"]

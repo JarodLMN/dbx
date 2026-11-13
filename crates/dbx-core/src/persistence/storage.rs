@@ -124,6 +124,11 @@ const PLUGIN_DATA_GRANTS_KEY: &str = "plugin_data_grants";
 /// Upper bound for one plugin's persisted data grants; consent is per
 /// connection, so a legitimate plugin never approaches it.
 const MAX_PLUGIN_DATA_GRANTS_PER_PLUGIN: usize = 512;
+/// `{ pluginId: { connectionId: ["insert", ...] } }` — connections a plugin may
+/// write to through `host.transfer:run` (docs/07 §9). Separate key from the read
+/// grants on purpose: the user must be able to revoke write consent alone.
+const PLUGIN_TRANSFER_GRANTS_KEY: &str = "plugin_transfer_grants";
+const MAX_PLUGIN_TRANSFER_GRANTS_PER_PLUGIN: usize = 512;
 const APP_STATE_AI_GLOBAL_INSTRUCTIONS_KEY: &str = "ai_global_custom_instructions";
 const APP_STATE_AI_CHAT_SELECTION_KEY: &str = "ai_chat_selection_v1";
 // Keep the existing key so previously persisted publish records remain readable.
@@ -5835,6 +5840,79 @@ impl Storage {
         .await
     }
 
+    /// Write grants for `host.transfer:run`: `[(connectionId, operations)]`.
+    ///
+    /// Stored in the app-settings bucket next to the read grants instead of a new
+    /// table: consent is a small per-user map and a migration would buy nothing. The
+    /// key is separate so write consent can be revoked without touching read access.
+    pub async fn load_plugin_transfer_grants(&self, plugin_id: &str) -> Result<Vec<(String, Vec<String>)>, String> {
+        let settings = self.load_app_settings_json().await?;
+        let mut grants = Vec::new();
+        if let Some(serde_json::Value::Object(connections)) =
+            settings.get(PLUGIN_TRANSFER_GRANTS_KEY).and_then(|grants| grants.get(plugin_id.trim()))
+        {
+            for (connection_id, operations) in connections {
+                grants.push((connection_id.clone(), normalized_string_list(Some(operations))));
+            }
+        }
+        grants.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(grants)
+    }
+
+    /// Records or revokes write consent for one plugin on one connection and returns
+    /// the plugin's updated grant list.
+    pub async fn set_plugin_transfer_grant(
+        &self,
+        plugin_id: &str,
+        connection_id: &str,
+        operations: Vec<String>,
+        granted: bool,
+    ) -> Result<Vec<(String, Vec<String>)>, String> {
+        let plugin_id = normalized_setting_id(plugin_id, "plugin id")?;
+        let connection_id = normalized_setting_id(connection_id, "connection id")?;
+        let mut operations: Vec<String> =
+            operations.into_iter().map(|operation| operation.trim().to_string()).filter(|operation| !operation.is_empty()).collect();
+        operations.sort();
+        operations.dedup();
+        self.with_conn(move |conn| {
+            let mut settings = app_settings_map_from_conn(conn)?;
+            let mut all_grants = match settings.remove(PLUGIN_TRANSFER_GRANTS_KEY) {
+                Some(serde_json::Value::Object(grants)) => grants,
+                _ => serde_json::Map::new(),
+            };
+            let mut connections = match all_grants.remove(&plugin_id) {
+                Some(serde_json::Value::Object(connections)) => connections,
+                _ => serde_json::Map::new(),
+            };
+            if granted {
+                if !connections.contains_key(&connection_id) && connections.len() >= MAX_PLUGIN_TRANSFER_GRANTS_PER_PLUGIN {
+                    return Err(format!(
+                        "A plugin can hold at most {MAX_PLUGIN_TRANSFER_GRANTS_PER_PLUGIN} write grants"
+                    ));
+                }
+                connections.insert(connection_id, serde_json::json!(operations));
+            } else {
+                connections.remove(&connection_id);
+            }
+            let mut grants: Vec<(String, Vec<String>)> = connections
+                .iter()
+                .map(|(connection_id, operations)| (connection_id.clone(), normalized_string_list(Some(operations))))
+                .collect();
+            grants.sort_by(|left, right| left.0.cmp(&right.0));
+            if connections.is_empty() {
+                all_grants.remove(&plugin_id);
+            } else {
+                all_grants.insert(plugin_id, serde_json::Value::Object(connections));
+            }
+            if !all_grants.is_empty() {
+                settings.insert(PLUGIN_TRANSFER_GRANTS_KEY.to_string(), serde_json::Value::Object(all_grants));
+            }
+            write_app_settings_map(conn, &settings)?;
+            Ok(grants)
+        })
+        .await
+    }
+
     /// Drops everything the user granted to a plugin (AI tool access and data
     /// grants). Called after uninstall so a reinstall starts without consent.
     pub async fn forget_plugin_permissions(&self, plugin_id: &str) -> Result<(), String> {
@@ -5848,6 +5926,9 @@ impl Storage {
             disabled.retain(|candidate| candidate != &plugin_id);
             settings.insert(AI_PLUGIN_TOOL_DISABLED_PLUGINS_KEY.to_string(), serde_json::json!(disabled));
             if let Some(serde_json::Value::Object(grants)) = settings.get_mut(PLUGIN_DATA_GRANTS_KEY) {
+                grants.remove(&plugin_id);
+            }
+            if let Some(serde_json::Value::Object(grants)) = settings.get_mut(PLUGIN_TRANSFER_GRANTS_KEY) {
                 grants.remove(&plugin_id);
             }
             if let Some(serde_json::Value::Object(grants)) = settings.get_mut(PLUGIN_MCP_GRANTS_KEY) {

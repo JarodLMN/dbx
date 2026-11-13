@@ -59,18 +59,23 @@ impl TaskType {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskLifecycleOwner {
     Tauri,
     Web,
+    /// A run a plugin asked the host to perform (`host.transfer:run`). The payload
+    /// is the plugin id, so the history view can attribute the run to it instead of
+    /// blaming the desktop shell (docs/07 §8).
+    Plugin(String),
 }
 
 impl TaskLifecycleOwner {
-    pub(crate) const fn as_storage_str(self) -> &'static str {
+    pub(crate) fn as_storage_str(&self) -> String {
         match self {
-            Self::Tauri => "tauri",
-            Self::Web => "web",
+            Self::Tauri => "tauri".to_string(),
+            Self::Web => "web".to_string(),
+            Self::Plugin(plugin_id) => format!("plugin:{plugin_id}"),
         }
     }
 
@@ -78,7 +83,12 @@ impl TaskLifecycleOwner {
         match value {
             "tauri" => Some(Self::Tauri),
             "web" => Some(Self::Web),
-            _ => None,
+            // Unknown owners must stay unknown: a plugin id keeps its `plugin:` prefix
+            // so a future owner kind cannot be mistaken for a plugin.
+            _ => value
+                .strip_prefix("plugin:")
+                .filter(|plugin_id| !plugin_id.is_empty())
+                .map(|plugin_id| Self::Plugin(plugin_id.to_string())),
         }
     }
 }

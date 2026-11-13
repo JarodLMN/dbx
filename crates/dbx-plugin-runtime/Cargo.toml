@@ -8,6 +8,9 @@ publish = false
 [features]
 default = []
 test-support = []
+# Plugin-initiated data transfer API (`host.transfer:run`, see docs/07): grant,
+# risk classification and the confirm-gate helpers. The desktop build enables it.
+plugin-transfer = []
 
 [dependencies]
 dbx-platform = { path = "../dbx-platform", features = ["host-prompts", "downloads"] }

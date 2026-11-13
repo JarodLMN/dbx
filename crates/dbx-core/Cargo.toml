@@ -6,6 +6,9 @@ license = "Apache-2.0"
 
 [features]
 test-support = []
+# Plugin-initiated writes through `host.transfer:run` (docs/07): turns on the
+# runtime gate. The Tauri layer enables it for the desktop build.
+plugin-transfer = ["dbx-plugin-runtime/plugin-transfer"]
 default = ["duckdb-sidecar", "dynamodb", "mq-admin", "sqlite-sqlcipher", "system-fonts"]
 duckdb-sidecar = ["dbx-sql/duckdb-sidecar", "dbx-drivers/duckdb-sidecar"]
 dynamodb = ["dbx-drivers/dynamodb"]

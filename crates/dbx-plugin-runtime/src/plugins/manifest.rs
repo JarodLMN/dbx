@@ -18,6 +18,11 @@ pub const SUPPORTED_PLUGIN_MANIFEST_VERSION: u32 = 1;
 /// keep working, and a plugin that wants a capability must check the
 /// advertised version (or the matching `capabilities` / `host.features` entry)
 /// before calling it.
+///
+/// `host.transfer:run` (docs/07) ships on the same 1.4 line: it is a permission
+/// plus a runtime capability flag, not a protocol bump, so a 1.4 host without the
+/// patch still installs the plugin. Plugins must branch on
+/// `capabilities.transferApi`, never on the version string.
 pub const SUPPORTED_PLUGIN_HOST_API_VERSION: &str = "1.4.0";
 /// Capabilities the host advertises to a plugin backend at `plugin/initialize`.
 pub const SUPPORTED_PLUGIN_HOST_FEATURES: &[&str] = &["host.requestUserInput"];
@@ -39,6 +44,9 @@ pub const SUPPORTED_PLUGIN_PERMISSIONS: &[&str] = &[
     "host.data:read",
     "host.connections:read",
     "host.connections::read",
+    // First write-class permission (docs/07): the plugin may *ask* the host to run
+    // a transfer. The host still shows its own confirmation dialog every time.
+    "host.transfer:run",
 ];
 
 /// Cap the number of `host.network:<origin>` entries so a manifest cannot bloat
