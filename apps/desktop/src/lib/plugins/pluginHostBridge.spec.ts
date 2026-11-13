@@ -1665,6 +1665,89 @@ describe("PluginHostBridge", () => {
     expect(partialInit.capabilities?.dataApi).toBe(false);
   });
 
+  function transferApi(overrides: Record<string, unknown> = {}) {
+    return {
+      invoke: vi.fn(),
+      notify: vi.fn(),
+      sendBinary: vi.fn(),
+      readAsset: vi.fn(),
+      previewTransfer: vi.fn().mockResolvedValue({
+        risk: { level: "l0", reasons: [], dryRun: true },
+        resolved: { tables: [], mode: "append", content: "structureAndData", createsTables: true, dropsTables: false },
+        operations: [],
+        requestHash: "hash-1",
+        dryRun: { structureSql: "CREATE TABLE t (id int)", operations: [], schemaObjectsExpanded: false, missingOwners: [], targetOwner: "root" },
+      }),
+      cancelTransfer: vi.fn().mockResolvedValue(undefined),
+      ...overrides,
+    };
+  }
+
+  function transferHarness(permissions: string[], api: ReturnType<typeof transferApi>) {
+    const messages: unknown[] = [];
+    const target = { postMessage: (message: unknown) => messages.push(message) } as unknown as Window;
+    const bridge = new PluginHostBridge(plugin(permissions), workbench, {}, () => target, api);
+    const call = async (id: string, method: string, params: unknown) => {
+      bridge.handleWindowMessage({ source: target, data: { source: "dbx-plugin", version: 1, type: "request", id, method, params } } as MessageEvent);
+      await vi.waitFor(() => expect(messages.some((message) => (message as { id?: string }).id === id)).toBe(true));
+      return messages.find((message) => (message as { id?: string }).id === id) as { result?: unknown; error?: string };
+    };
+    return { bridge, messages, call };
+  }
+
+  it("serves host.transfer.preview only with host.transfer:run and refuses a request that pre-confirms the drop", async () => {
+    const denied = transferHarness([], transferApi());
+    expect(await denied.call("no-permission", "host.transfer.preview", { transferId: "t1" })).toMatchObject({ error: "Plugin has not declared permission 'host.transfer:run'" });
+
+    const api = transferApi();
+    const { call } = transferHarness(["host.transfer:run"], api);
+    // The bridge owns the plugin id and trims it onto the request; dryRun travels as-is.
+    const preview = await call("dry", "host.transfer.preview", { transferId: " t1 ", dryRun: true });
+    expect(preview).toMatchObject({ result: { requestHash: "hash-1", dryRun: { structureSql: expect.stringContaining("CREATE TABLE") } } });
+    expect(api.previewTransfer).toHaveBeenCalledWith("sample", { transferId: "t1", dryRun: true });
+
+    // A pre-set confirmation bit is an attempt to skip the dialog, not a parameter error.
+    expect(await call("preconfirmed", "host.transfer.preview", { transferId: "t2", dropTargetConfirmed: true })).toMatchObject({ error: expect.stringContaining("E-TRANSFER-PRECONFIRMED") });
+    expect(await call("no-id", "host.transfer.preview", {})).toMatchObject({ error: "host.transfer: transferId is required" });
+    expect(await call("blank-id", "host.transfer.preview", { transferId: "   " })).toMatchObject({ error: "host.transfer: transferId is required" });
+    expect(await call("long-id", "host.transfer.preview", { transferId: "x".repeat(129) })).toMatchObject({ error: "transferId must be at most 128 characters" });
+    expect(await call("bad-dry-run", "host.transfer.preview", { transferId: "t3", dryRun: "yes" })).toMatchObject({ error: "dryRun must be a boolean" });
+    expect(api.previewTransfer).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses host.transfer.run until the host owns the dialog and scopes cancel to the calling plugin", async () => {
+    const api = transferApi();
+    const { call } = transferHarness(["host.transfer:run"], api);
+
+    const run = await call("run", "host.transfer.run", { request: { transferId: "t1" }, requestHash: "hash-1", approved: true });
+    expect(run).toMatchObject({ error: expect.stringContaining("no confirmation dialog") });
+
+    expect(await call("cancel", "host.transfer.cancel", { runId: "run-1" })).toMatchObject({ result: null });
+    expect(api.cancelTransfer).toHaveBeenCalledWith("sample", "run-1");
+    expect(await call("cancel-no-id", "host.transfer.cancel", {})).toMatchObject({ error: "runId is invalid" });
+  });
+
+  it("advertises transferPreview without transferApi until the confirm surface exists", () => {
+    const previewOnly = transferHarness(["host.transfer:run"], transferApi());
+    previewOnly.bridge.sendInit();
+    const init = previewOnly.messages.find((message) => (message as { type?: string }).type === "init") as { capabilities?: Record<string, unknown> };
+    expect(init.capabilities?.transferPreview).toBe(true);
+    // Preview can plan a write; it must never claim the host can perform one.
+    expect(init.capabilities?.transferApi).toBe(false);
+
+    const full = transferHarness(["host.transfer:run"], transferApi({ runTransfer: vi.fn().mockResolvedValue({ runId: "run-1" }) }));
+    full.bridge.sendInit();
+    const fullInit = full.messages.find((message) => (message as { type?: string }).type === "init") as { capabilities?: Record<string, unknown> };
+    expect(fullInit.capabilities?.transferApi).toBe(true);
+  });
+
+  it("exposes the transfer namespace in the sandbox SDK", () => {
+    const source = pluginSdkSource();
+    expect(source).toContain("transfer: Object.freeze({");
+    expect(source).toContain("request('host.transfer.preview', transferRequest)");
+    expect(source).toContain("request('host.transfer.cancel', args || {})");
+  });
+
   it("denies clipboard reads on hosts without a consent surface and rate-limits repeated reads", async () => {
     const messages: unknown[] = [];
     const target = { postMessage: (message: unknown) => messages.push(message) } as unknown as Window;

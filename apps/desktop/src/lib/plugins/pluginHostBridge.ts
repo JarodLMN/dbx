@@ -11,6 +11,7 @@ import type { PluginAiRecommendation } from "@/types/pluginAiRecommendations";
 import { MAX_PLUGIN_SCHEMA_METADATA_NAME_CHARS, PLUGIN_SCHEMA_METADATA_CAPABILITY, PLUGIN_SCHEMA_METADATA_PERMISSION, type PluginTableContext, type PluginTableMetadata } from "@/types/pluginSchemaMetadata";
 import { MAX_PLUGIN_DATA_MAX_ROWS, MAX_PLUGIN_DATA_NAME_CHARS, MAX_PLUGIN_DATA_SQL_CHARS, MAX_PLUGIN_DATA_TIMEOUT_MS, PLUGIN_DATA_ACCESS_NOT_GRANTED, PLUGIN_DATA_CAPABILITY, PLUGIN_DATA_READ_PERMISSION, type PluginDataQueryRequest, type PluginDataQueryResult } from "@/types/pluginData";
 import { PLUGIN_CONNECTIONS_CAPABILITY, PLUGIN_CONNECTIONS_READ_PERMISSION, type PluginConnectionSummary } from "@/types/pluginConnection";
+import { PLUGIN_TRANSFER_CAPABILITY, PLUGIN_TRANSFER_PERMISSION, PLUGIN_TRANSFER_PREVIEW_CAPABILITY, requirePluginTransferRequest, type PluginTransferPreview, type PluginTransferRunHandle } from "@/types/pluginTransfer";
 import { floatingWindowLabel } from "@/lib/app/windowContext";
 import { parseFloatingWindowRequest, type FloatingRect, type OpenFloatingWindowRequest, type OpenFloatingWindowResult } from "@/lib/plugins/pluginFloatingWindow";
 
@@ -250,6 +251,22 @@ export interface PluginHostBridgeApi {
   confirmDataAccess?(pluginId: string, pluginName: string, connectionId: string): Promise<boolean> | boolean;
   /** Persists the grant the user just allowed. */
   grantDataAccess?(pluginId: string, connectionId: string): Promise<void>;
+  /**
+   * Resolve what a transfer request would do, without writing anything
+   * (`host.transfer:run`). A `dryRun: true` request also returns the plan the
+   * write pass would execute; the backend owns every validation.
+   */
+  previewTransfer?(pluginId: string, request: Record<string, unknown>): Promise<PluginTransferPreview>;
+  /**
+   * Run a transfer the user approved in the host's own dialog.
+   *
+   * Deliberately optional: `run` without a host-owned confirm surface would let
+   * a plugin write by asking twice, so the bridge advertises `transferApi` only
+   * when this is present.
+   */
+  runTransfer?(pluginId: string, request: Record<string, unknown>, requestHash: string, approved: boolean): Promise<PluginTransferRunHandle>;
+  /** Cancel one of this plugin's own runs; another plugin's run is refused by the backend. */
+  cancelTransfer?(pluginId: string, runId: string): Promise<void>;
   closeTab?(): Promise<void> | void;
   /**
    * Floating plugin windows (the §8.3 "window" surface): a frameless,
@@ -549,6 +566,12 @@ export class PluginHostBridge {
           folderExpansion: !!this.api.receiveOsDrops,
         },
         [PLUGIN_CONNECTIONS_CAPABILITY]: !!this.api.listConnections || !!this.api.listAllConnections,
+        // Transfer flags are separate on purpose. `transferPreview` covers a dry
+        // run, which writes nothing and needs no dialog; `transferApi` means
+        // "can really write" and stays false until the host owns the confirm
+        // surface, so a plugin sees one honest flag instead of probing.
+        [PLUGIN_TRANSFER_PREVIEW_CAPABILITY]: !!this.api.previewTransfer,
+        [PLUGIN_TRANSFER_CAPABILITY]: !!this.api.previewTransfer && !!this.api.runTransfer && !!this.api.cancelTransfer,
       },
       context: snapshotPluginWorkbenchContext(this.context),
     });
@@ -919,6 +942,32 @@ export class PluginHostBridge {
       } finally {
         this.inFlightDataQueries -= 1;
       }
+    }
+    if (method === "host.transfer.preview") {
+      this.requirePermission(PLUGIN_TRANSFER_PERMISSION);
+      if (!this.api.previewTransfer) throw new Error("Host transfer preview is unavailable");
+      const request = requirePluginTransferRequest(requireRecord(params, "host.transfer.preview params"));
+      return this.api.previewTransfer(this.plugin.manifest.id, request);
+    }
+    if (method === "host.transfer.run") {
+      this.requirePermission(PLUGIN_TRANSFER_PERMISSION);
+      // `requestHash` and `approved` must come from the host's own dialog. Until
+      // that dialog exists there is nothing honest to forward, so the call fails
+      // closed even if a plugin ignores `capabilities.transferApi`.
+      if (!this.api.runTransfer) throw new Error("Host transfer run is unavailable: this DBX build has no confirmation dialog for plugin writes");
+      const input = requireRecord(params, "host.transfer.run params");
+      const request = requirePluginTransferRequest(requireRecord(input.request, "host.transfer.run request"));
+      if (typeof input.requestHash !== "string" || !input.requestHash.trim()) throw new Error("host.transfer.run requires requestHash");
+      if (typeof input.approved !== "boolean") throw new Error("host.transfer.run requires an approved flag");
+      return this.api.runTransfer(this.plugin.manifest.id, request, input.requestHash.trim(), input.approved);
+    }
+    if (method === "host.transfer.cancel") {
+      this.requirePermission(PLUGIN_TRANSFER_PERMISSION);
+      if (!this.api.cancelTransfer) throw new Error("Host transfer cancel is unavailable");
+      const input = requireRecord(params, "host.transfer.cancel params");
+      const runId = requireProtocolName(input.runId, "runId");
+      await this.api.cancelTransfer(this.plugin.manifest.id, runId);
+      return null;
     }
     if (method === "host.saveFile") {
       const input = isRecord(params) ? params : {};
@@ -1584,6 +1633,15 @@ export function pluginSdkSource(initialTheme?: PluginBridgeTheme): string {
         get: (key) => request('host.storageGet', { key }),
         set: (key, value) => request('host.storageSet', { key, value: value === undefined ? null : value }),
         delete: (key) => request('host.storageDelete', { key }),
+      }),
+      // Write-class host API (host.transfer:run, docs/07). Two capabilities, not
+      // one: transferPreview covers preview and dry runs (nothing is written),
+      // transferApi means the host can also run an approved write. Neither is
+      // implied by host_api - an older host simply omits them.
+      transfer: Object.freeze({
+        preview: (transferRequest) => request('host.transfer.preview', transferRequest),
+        run: (transferRequest, intent) => request('host.transfer.run', { request: transferRequest, intent }),
+        cancel: (args) => request('host.transfer.cancel', args || {}),
       }),
       fileTransfer: Object.freeze({
         pick: (options) => request('host.pickFiles', options || {}),

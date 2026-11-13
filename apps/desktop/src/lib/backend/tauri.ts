@@ -82,6 +82,7 @@ import { collectBrowserSupportInfo } from "@/lib/app/supportInfo";
 import type { PluginPlanCapabilities, PluginPlanRequest, PluginPlanResult } from "@/types/pluginPlan";
 import type { PluginTableMetadata, PluginTableMetadataRequest } from "@/types/pluginSchemaMetadata";
 import type { PluginDataGrant, PluginDataQueryRequest, PluginDataQueryResult } from "@/types/pluginData";
+import { rethrowPluginTransferError, type PluginTransferPreview } from "@/types/pluginTransfer";
 import type { AiToolApprovalOutcome, PluginToolPreview } from "@/types/pluginAiTools";
 
 function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
@@ -2513,6 +2514,23 @@ export async function getPluginDataGrants(pluginId: string): Promise<PluginDataG
 
 export async function setPluginDataGrant(pluginId: string, connectionId: string, granted: boolean): Promise<PluginDataGrant[]> {
   return invoke<PluginDataGrant[]>("set_plugin_data_grant", { pluginId, connectionId, granted });
+}
+
+/**
+ * Plugin Host API (`host.transfer:run`): resolve what a request would do, with the
+ * risk the host sees. Read-only. A `dryRun: true` request also returns the
+ * statements the write pass would execute, rendered by the same generators.
+ *
+ * The command rejects with `{ code, message }`; `rethrowPluginTransferError`
+ * keeps the `E-TRANSFER-*` code in front so the plugin can branch on it.
+ */
+export async function previewPluginTransfer(pluginId: string, request: Record<string, unknown>): Promise<PluginTransferPreview> {
+  return invoke<PluginTransferPreview>("plugin_transfer_preview", { pluginId, request }).catch(rethrowPluginTransferError);
+}
+
+/** Cancel one of this plugin's own runs (`host.transfer:run`); the backend checks ownership. */
+export async function cancelPluginTransfer(pluginId: string, runId: string): Promise<void> {
+  return invoke<void>("plugin_transfer_cancel", { pluginId, runId }).catch(rethrowPluginTransferError);
 }
 
 export async function buildDroppedFilePreviewSql(options: DroppedFilePreviewSqlOptions): Promise<string | undefined> {

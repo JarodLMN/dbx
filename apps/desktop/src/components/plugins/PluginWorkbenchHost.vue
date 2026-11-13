@@ -674,6 +674,12 @@ function createBridge() {
       grantDataAccess: async (pluginId, connectionId) => {
         await api.setPluginDataGrant(pluginId, connectionId, true);
       },
+      // host.transfer:run — preview and dry runs only. `runTransfer` is left
+      // unwired on purpose: it needs the host-side confirm dialog (L4), so the
+      // bridge advertises `transferApi` as false and plugins degrade to E0
+      // instead of believing they can write.
+      previewTransfer: isTauriRuntime() ? (pluginId, request) => api.previewPluginTransfer(pluginId, request) : undefined,
+      cancelTransfer: isTauriRuntime() ? (pluginId, runId) => api.cancelPluginTransfer(pluginId, runId) : undefined,
       closeTab: () => emit("closeTab"),
       // Floating widget windows (§8.3 surface "window"). Desktop-only: the web
       // host omits them so capabilities.floating stays false and the plugin can

@@ -273,6 +273,7 @@ import type {
 import type { QueryEditability } from "@/lib/sql/sqlAnalysis";
 import type { PluginTableMetadata, PluginTableMetadataRequest } from "@/types/pluginSchemaMetadata";
 import type { PluginDataGrant, PluginDataQueryRequest, PluginDataQueryResult } from "@/types/pluginData";
+import type { PluginTransferPreview } from "@/types/pluginTransfer";
 import type { PluginToolPreview } from "@/types/pluginAiTools";
 import type { CsvQuoteMode } from "@/lib/export/csvQuoteMode";
 import type { MigrationPreflight, MigrationReport, CredentialResetPreparation, CredentialResetReport } from "./migration";
@@ -2077,6 +2078,19 @@ export async function getPluginDataGrants(pluginId: string): Promise<PluginDataG
 
 export async function setPluginDataGrant(pluginId: string, connectionId: string, granted: boolean): Promise<PluginDataGrant[]> {
   return post<PluginDataGrant[]>("/api/plugin/data/grant", { pluginId, connectionId, granted });
+}
+
+/**
+ * Transfers run through the desktop host's command layer only: the web build has
+ * no `plugin_transfer_*` commands (docs/07 §17), so it advertises no transfer
+ * capability. These stubs exist to keep both transports signature-compatible.
+ */
+export async function previewPluginTransfer(_pluginId: string, _request: Record<string, unknown>): Promise<PluginTransferPreview> {
+  throw new Error("Plugin transfers are not available in the web backend");
+}
+
+export async function cancelPluginTransfer(_pluginId: string, _runId: string): Promise<void> {
+  throw new Error("Plugin transfers are not available in the web backend");
 }
 
 export async function buildDroppedFilePreviewSql(options: DroppedFilePreviewSqlOptions): Promise<string | undefined> {
