@@ -110,6 +110,11 @@ pub use data::table_import;
 pub use data::transfer;
 pub use data::transfer_rebuild;
 pub use data::transfer_runner;
+
+/// Host side assembly for `host.transfer:run` (docs/07): endpoint resolution, risk
+/// input gathering and the request hash. Decision rules live in
+/// `dbx_plugin_runtime::transfer::gate`.
+pub mod plugin_transfer;
 pub use dbx_drivers::ssh_config;
 pub use dbx_formats::sql_file_zip_package;
 pub use dbx_formats::temporal_format;
