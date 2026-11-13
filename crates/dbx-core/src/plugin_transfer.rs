@@ -98,8 +98,10 @@ pub async fn preview(state: &AppState, request: &TransferRequest, raw: &Value) -
     // Same endpoint means "same connection + same database + same schema"; the gate owns
     // that definition so preview and run can never disagree about it.
     let same_endpoint = gate::check_same_endpoint(&gate_request).is_err();
-    let source = endpoint_card(state, &request.source_connection_id, &request.source_database, &request.source_schema).await;
-    let target = endpoint_card(state, &request.target_connection_id, &request.target_database, &request.target_schema).await;
+    let source =
+        endpoint_card(state, &request.source_connection_id, &request.source_database, &request.source_schema).await;
+    let target =
+        endpoint_card(state, &request.target_connection_id, &request.target_database, &request.target_schema).await;
 
     let mode = enum_label(&request.mode);
     let content = enum_label(&request.content);
@@ -112,10 +114,10 @@ pub async fn preview(state: &AppState, request: &TransferRequest, raw: &Value) -
         mode_overwrite_or_upsert: matches!(mode.as_str(), "overwrite" | "upsert"),
         ownership_policy_not_preserve: ownership_policy != "preserve",
         non_table_object_count: request.objects.as_ref().map(|objects| objects.len()).unwrap_or(0),
-        same_connection_other_table: request.source_connection_id == request.target_connection_id
-            && !same_endpoint,
+        same_connection_other_table: request.source_connection_id == request.target_connection_id && !same_endpoint,
         target_production: target.production,
         target_readonly: false,
+        dry_run: gate_request.dry_run,
         estimated_rows: gate_request.estimated_rows,
     };
 
@@ -142,6 +144,9 @@ pub async fn preview(state: &AppState, request: &TransferRequest, raw: &Value) -
             estimated_rows: gate_request.estimated_rows,
         },
         request_hash: gate::request_hash(raw),
-        operations: gate::operations_for_request(&gate_request).into_iter().map(|operation| operation.as_str().to_string()).collect(),
+        operations: gate::operations_for_request(&gate_request)
+            .into_iter()
+            .map(|operation| operation.as_str().to_string())
+            .collect(),
     }
 }

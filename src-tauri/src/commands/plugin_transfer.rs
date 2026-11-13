@@ -59,10 +59,7 @@ fn forget_run(run_id: &str) {
 
 /// Per plugin in-flight count for the concurrency gate (docs/07: max 3).
 fn runs_in_flight(plugin_id: &str) -> usize {
-    run_owners()
-        .lock()
-        .map(|owners| owners.values().filter(|owner| owner.as_str() == plugin_id).count())
-        .unwrap_or(0)
+    run_owners().lock().map(|owners| owners.values().filter(|owner| owner.as_str() == plugin_id).count()).unwrap_or(0)
 }
 
 fn gate_request(request: &Value) -> Result<gate::TransferGateRequest, PluginTransferError> {
@@ -111,7 +108,11 @@ pub async fn plugin_transfer_preview(
     gate::check_not_preconfirmed(&gate_request)?;
     gate::check_same_endpoint(&gate_request)?;
     let parsed = parse_request(&request)?;
-    ensure_writable_target(&state, &parsed.target_connection_id).await?;
+    // A dry run only reads the target, so a read-only connection is a valid target
+    // for it. The write path below keeps the veto.
+    if !gate_request.dry_run {
+        ensure_writable_target(&state, &parsed.target_connection_id).await?;
+    }
     dbx_core::transfer::validate_transfer_request(&parsed)
         .map_err(|message| PluginTransferError::new("E-TRANSFER-INVALID-REQUEST", message))?;
     let _ = plugin_id;
@@ -135,6 +136,12 @@ pub async fn plugin_transfer_run(
     let gate_request = gate_request(&request)?;
     gate::check_not_preconfirmed(&gate_request)?;
     gate::check_same_endpoint(&gate_request)?;
+    if gate_request.dry_run {
+        // The gate already understands dry runs (no grant, no write risk, no L2), but
+        // the runner cannot honour one yet: it would still write. Refusing here is
+        // what keeps an "approved dry run" from silently becoming a real write.
+        return Err(GateError::dryrun_unsupported().into());
+    }
 
     if gate::request_hash(&request) != request_hash {
         return Err(GateError::stale().into());
@@ -206,10 +213,7 @@ pub async fn plugin_transfer_get_grants(
         .load_plugin_transfer_grants(&plugin_id)
         .await
         .map_err(|message| PluginTransferError::new("E-TRANSFER-NOT-AUTHORIZED", message))?;
-    Ok(stored
-        .into_iter()
-        .map(|(connection_id, operations)| TransferGrantView { connection_id, operations })
-        .collect())
+    Ok(stored.into_iter().map(|(connection_id, operations)| TransferGrantView { connection_id, operations }).collect())
 }
 
 /// Write a grant. Only the app shell calls this, after the user answered "always allow"
@@ -239,8 +243,5 @@ pub async fn plugin_transfer_set_grant(
         .set_plugin_transfer_grant(&plugin_id, &connection_id, normalized.into_iter().collect(), granted)
         .await
         .map_err(|message| PluginTransferError::new("E-TRANSFER-NOT-AUTHORIZED", message))?;
-    Ok(stored
-        .into_iter()
-        .map(|(connection_id, operations)| TransferGrantView { connection_id, operations })
-        .collect())
+    Ok(stored.into_iter().map(|(connection_id, operations)| TransferGrantView { connection_id, operations }).collect())
 }

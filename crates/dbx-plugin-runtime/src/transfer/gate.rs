@@ -127,6 +127,9 @@ pub struct RiskReason {
 pub struct Risk {
     pub level: RiskLevel,
     pub reasons: Vec<RiskReason>,
+    /// True when this risk belongs to a dry run: the dialog shows *what would
+    /// happen*, but nothing is written, so no write risk is raised.
+    pub dry_run: bool,
 }
 
 /// Host-owned facts the plugin cannot influence (docs/07 §6).
@@ -141,12 +144,22 @@ pub struct RiskInput {
     pub same_connection_other_table: bool,
     pub target_production: bool,
     pub target_readonly: bool,
+    /// Plan and measure only (docs/07 §13): no table is created, no row is
+    /// written, nothing is renamed or dropped.
+    pub dry_run: bool,
     /// `None` means the plugin supplied no estimate, which is an L2 signal.
     pub estimated_rows: Option<u64>,
 }
 
 /// Classify a request (docs/07 §6). The level is the maximum of every hit.
 pub fn classify_risk(input: &RiskInput) -> Risk {
+    // A dry run writes nothing, so every rule below (which describes a *write*) is
+    // moot. Level L0 is not a downgrade for convenience: it is what the user is
+    // being asked to approve - reading a target and producing a plan.
+    if input.dry_run {
+        return Risk { level: RiskLevel::L0, reasons: Vec::new(), dry_run: true };
+    }
+
     let mut reasons: Vec<RiskReason> = Vec::new();
     let mut level = RiskLevel::L0;
 
@@ -250,7 +263,7 @@ pub fn classify_risk(input: &RiskInput) -> Risk {
         );
     }
 
-    Risk { level, reasons }
+    Risk { level, reasons, dry_run: false }
 }
 
 /// The subset of `TransferRequest` the gate needs. Every field is optional with a
@@ -291,6 +304,10 @@ pub struct TransferGateRequest {
     /// Must stay false: the host fills it after the user confirms (docs/07 §1).
     #[serde(default)]
     pub drop_target_confirmed: bool,
+    /// Plan and measure only. Part of the request hash on purpose: an approval
+    /// given for a dry run must never be replayable as a real write.
+    #[serde(default)]
+    pub dry_run: bool,
     #[serde(default)]
     pub estimated_rows: Option<u64>,
     #[serde(default)]
@@ -335,6 +352,11 @@ fn norm(value: &str) -> String {
 
 /// `TransferPreview.risk` reasons plus the operations the grant must cover.
 pub fn operations_for_request(request: &TransferGateRequest) -> BTreeSet<TransferOperation> {
+    // Nothing is written, so no grant can be needed; callers still must not treat
+    // an empty set as "any operation is allowed" (see check_grant_or_dry_run).
+    if request.dry_run {
+        return BTreeSet::new();
+    }
     let mut operations = BTreeSet::new();
     operations.insert(TransferOperation::Insert);
     let mode = request.mode.as_deref().unwrap_or_default();
@@ -400,6 +422,13 @@ impl GateError {
     pub fn invalid_request(detail: impl Into<String>) -> Self {
         Self::new("E-TRANSFER-INVALID-REQUEST", detail)
     }
+
+    /// The gate understands dry runs (no grant, no write risk) but this host build
+    /// cannot execute one yet: the runner would still write. Refusing here is the
+    /// interlock that keeps an accepted "dry run" from becoming a real one.
+    pub fn dryrun_unsupported() -> Self {
+        Self::new("E-TRANSFER-DRYRUN-UNSUPPORTED", "this host build cannot execute a dry run yet")
+    }
 }
 
 impl std::fmt::Display for GateError {
@@ -438,6 +467,21 @@ pub fn check_grant(grants: &[TransferGrant], connection_id: &str, needed: &BTree
         .find(|grant| grant.connection_id == connection_id && grant.covers(needed))
         .map(|_| ())
         .ok_or_else(GateError::not_authorized)
+}
+
+/// Dry runs need no grant: they write nothing, so `operations_for_request` is empty
+/// and the lookup is skipped. A real request still needs a grant covering every
+/// operation, which is the point of keeping the two paths in one function.
+pub fn check_grant_or_dry_run(
+    grants: &[TransferGrant],
+    connection_id: &str,
+    request: &TransferGateRequest,
+) -> Result<(), GateError> {
+    let needed = operations_for_request(request);
+    if needed.is_empty() {
+        return Ok(());
+    }
+    check_grant(grants, connection_id, &needed)
 }
 
 /// docs/07 §7: at most `MAX_PLUGIN_TRANSFER_RUNS` runs in flight per plugin.
@@ -631,6 +675,49 @@ mod tests {
         let a = json!({"a": 1, "b": {"c": 2, "d": 3}});
         let b = json!({"b": {"d": 3, "c": 2}, "a": 1});
         assert_eq!(request_hash(&a), request_hash(&b));
+    }
+
+    #[test]
+    fn dry_run_needs_no_operations_and_no_grant() {
+        let mut request = base_request();
+        request.dry_run = true;
+        request.create_table = true;
+        request.drop_target_before_create = true;
+        assert!(operations_for_request(&request).is_empty());
+        // No grants at all: still allowed, because nothing is written.
+        assert!(check_grant_or_dry_run(&[], "c2", &request).is_ok());
+    }
+
+    #[test]
+    fn dry_run_is_l0_even_for_destructive_requests() {
+        let risk = classify_risk(&RiskInput {
+            table_count: 30,
+            create_table: true,
+            drop_target_before_create: true,
+            mode_overwrite_or_upsert: true,
+            target_production: true,
+            estimated_rows: None,
+            dry_run: true,
+            ..RiskInput::default()
+        });
+        assert_eq!(risk.level, RiskLevel::L0);
+        assert!(risk.reasons.is_empty());
+        assert!(risk.dry_run);
+    }
+
+    #[test]
+    fn dry_run_cannot_be_replayed_as_a_write() {
+        let dry = json!({"targetDatabase": "shop", "tables": ["orders"], "dryRun": true});
+        let real = json!({"targetDatabase": "shop", "tables": ["orders"], "dryRun": false});
+        let absent = json!({"targetDatabase": "shop", "tables": ["orders"]});
+        assert_ne!(request_hash(&dry), request_hash(&real));
+        assert_ne!(request_hash(&dry), request_hash(&absent));
+    }
+
+    #[test]
+    fn real_request_still_needs_a_grant() {
+        let request = base_request();
+        assert_eq!(check_grant_or_dry_run(&[], "c2", &request).unwrap_err().code, "E-TRANSFER-NOT-AUTHORIZED");
     }
 
     #[test]
